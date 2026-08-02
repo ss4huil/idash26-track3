@@ -74,7 +74,15 @@ FEAT_DIM = (len(_ATOM_SYMBOLS) + 1) + len(_DEGREE) + (len(_NUM_HS) + 1) \
     + (len(_IMP_VALENCE) + 1) + (len(_FORMAL_CHG) + 1) + (len(_HYBRID) + 1) + 2
 
 
-def smile_to_dense_graph(smile: str, nmax: int = 128):
+def count_atoms(smile: str) -> int:
+    """Number of heavy atoms RDKit assigns to a SMILES (== graph node count)."""
+    mol = Chem.MolFromSmiles(smile)
+    if mol is None:
+        raise ValueError(f"RDKit could not parse SMILES: {smile!r}")
+    return mol.GetNumAtoms()
+
+
+def smile_to_dense_graph(smile: str, nmax: int = 138):
     """SMILES → (X, A_hat, mask) dense fixed-size representation (spec §6)."""
     mol = Chem.MolFromSmiles(smile)
     if mol is None:

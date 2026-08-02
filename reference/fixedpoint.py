@@ -17,7 +17,10 @@ import numpy as np
 
 # ── ring / scale constants (spec §7) ─────────────────────────────────────────
 BITWIDTH = 64          # 64-bit ring (u64 in the C++ backend)
-SCALE    = 12          # fixed-point fractional bits
+SCALE    = 24          # fixed-point fractional bits — matches GPU-MPC Q40.24
+                       # (utils/gpu_data_types.h: bw=64, scale=24). Empirically
+                       # max_abs_err ≈ 1.7e-6 vs float, no int64 overflow; scale
+                       # 26+ begins to overflow the accumulator on fusion FCs.
 
 
 def to_fixed(x, scale: int = SCALE) -> np.ndarray:

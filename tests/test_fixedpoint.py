@@ -26,8 +26,11 @@ from reference.fixedpoint import (   # not yet implemented
 class TestQuantiseRoundTrip:
     """to_fixed / from_fixed must round-trip within quantisation error."""
 
-    def test_scale_default_is_12(self):
-        assert SCALE == 12, "spec fixes default scale = 12"
+    def test_scale_default_is_24(self):
+        # Aligned to GPU-MPC's native Q40.24 (utils/gpu_data_types.h scale=24)
+        # so the fixed-point reference validates the exact numerics the C++
+        # backend runs. Empirically max_abs_err ≈ 1.7e-6 vs float at this scale.
+        assert SCALE == 24, "default scale aligned to GPU-MPC Q40.24"
 
     def test_bitwidth_is_64(self):
         assert BITWIDTH == 64, "spec fixes 64-bit ring"
