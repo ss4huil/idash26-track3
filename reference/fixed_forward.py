@@ -2,16 +2,17 @@
 Fixed-point forward pass — the golden reference for the MPC-secured portion.
 
 `FixedAffinity` wraps a float `AffinityModel` and runs its *secured* layers
-(drug GCN path + fusion FC) over a 64-bit integer ring at a fixed scale, using
-exactly the arithmetic the GPU-MPC backend performs (int64, one truncation per
-matmul via arithmetic right shift). This lets us measure quantisation error
-against the float model before any C++ is written.
+(drug GCN path + fusion FC) over a bw-bit integer ring at a fixed scale, using
+exactly the arithmetic the GPU-MPC backend performs (one truncation per matmul
+via arithmetic right shift, then reduction into the signed bw-bit ring).
+
+  bw=64 (default) : Z_{2^64} — matches the production 64-bit backend.
+  bw=32           : Z_{2^32} — narrower ring for testing half-width compute.
 
 Split of labour (spec §3 privacy model):
   • drug GCN path + fusion FC  → fixed-point int64   (secret-shared in MPC)
   • protein GatedCNN           → float, public        (plaintext)
-The public protein vector is quantised at the fusion boundary, i.e. exactly
-where it is secret-shared into the MPC fusion network.
+The public protein vector is quantised at the fusion boundary.
 """
 import numpy as np
 
@@ -19,40 +20,51 @@ from reference.fixedpoint import to_fixed, from_fixed, fixed_matmul, SCALE
 from reference.dense_graph import smile_to_dense_graph
 from reference.affinity_model import seq_cat
 
-# most-negative sentinel for masked positions in the fixed-point max-pool.
-# int64 floor, kept away from the true minimum to avoid accidental overflow on
-# any downstream add (there is none before the max, but be safe).
-_NEG_SENTINEL = np.int64(-(1 << 62))
-
 
 def _relu_fx(x):
     return np.maximum(x, np.int64(0))
 
 
 class FixedAffinity:
-    def __init__(self, model, scale: int = SCALE):
-        self.m = model
-        self.s = int(scale)
+    def __init__(self, model, scale: int = SCALE, bw: int = 64):
+        self.m  = model
+        self.s  = int(scale)
+        self.bw = int(bw)
+        # Signed bw-bit sentinel for masked max-pool positions.
+        # Kept 2 bits away from the ring floor so bw=64 matches the previous
+        # -(1<<62) constant, and bw=32 gives -(1<<30) — well inside [-2^31,2^31).
+        self._neg_sentinel = np.int64(-(1 << (self.bw - 2)))
         q = lambda a: to_fixed(a, self.s)
         # pre-quantise every public weight once
         self.gcn_fx     = [(q(W), q(b)) for (W, b) in model.gcn]
         self.drug_fc_fx = [(q(W), q(b)) for (W, b) in model.drug_fc]
         self.fusion_fx  = [(q(W), q(b)) for (W, b) in model.fusion]
 
+    # ── ring reduction ────────────────────────────────────────────────────────
+    def _wrap(self, x: np.ndarray) -> np.ndarray:
+        """Reduce int64 values into the signed bw-bit ring (no-op for bw=64)."""
+        if self.bw >= 64:
+            return x
+        modulus = np.int64(1) << self.bw        # 2^bw  (fits in int64 for bw<64)
+        half    = modulus >> np.int64(1)         # 2^(bw-1)
+        x = np.asarray(x, dtype=np.int64)
+        x_mod = x & (modulus - np.int64(1))     # unsigned mod via bitmask
+        return np.where(x_mod >= half, x_mod - modulus, x_mod)
+
     # ── fixed-point primitives ────────────────────────────────────────────────
     def _linear(self, x_fx, W_fx, b_fx):
         """y = x @ W.T + b  in fixed-point. x:(...,in) W:(out,in) → (...,out)."""
-        x2 = np.atleast_2d(x_fx)                       # (n, in)
-        y = fixed_matmul(x2, W_fx.T, self.s)           # (n, out) @ scale s
-        y = y + b_fx                                   # bias already @ scale s
+        x2 = np.atleast_2d(x_fx)                           # (n, in)
+        y  = self._wrap(fixed_matmul(x2, W_fx.T, self.s))  # truncate then wrap
+        y  = self._wrap(y + b_fx)                           # bias add then wrap
         return y.reshape(x_fx.shape[:-1] + (W_fx.shape[0],)) if x_fx.ndim > 1 \
             else y.reshape(W_fx.shape[0])
 
     def _gcn_layer(self, H_fx, A_fx, W_fx, b_fx):
         """A_hat @ (X @ W.T) + b, all fixed-point (two truncations)."""
-        XW = fixed_matmul(H_fx, W_fx.T, self.s)        # (N, out) @ s
-        out = fixed_matmul(A_fx, XW, self.s)           # (N, out) @ s
-        return out + b_fx                              # broadcast bias @ s
+        XW  = self._wrap(fixed_matmul(H_fx, W_fx.T, self.s))  # (N, out) @ s
+        out = self._wrap(fixed_matmul(A_fx, XW,    self.s))    # (N, out) @ s
+        return self._wrap(out + b_fx)                           # bias @ s
 
     # ── secured drug path (fixed-point) ─────────────────────────────────────────
     def _drug_path_fx(self, X, A_hat, mask):
@@ -64,7 +76,7 @@ class FixedAffinity:
         # masked global max-pool over atoms: real atoms keep value, padded rows
         # are forced to the negative sentinel then max'd away.
         keep = (np.asarray(mask).reshape(-1, 1) != 0)
-        masked = np.where(keep, H, _NEG_SENTINEL)
+        masked = np.where(keep, H, self._neg_sentinel)
         pooled = masked.max(axis=0)                    # (376,) @ s
         # Drug_FCs: 376→1024 (relu) → 128
         W0, b0 = self.drug_fc_fx[0]

@@ -1,0 +1,12 @@
+/home/jiang/master/idash/mpc/baseline/official_baseline_data.py:31: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(np, _name):
+/home/jiang/master/idash/mpc/baseline/official_baseline_data.py:31: FutureWarning: In the future `np.bool` will be defined as the corresponding NumPy scalar.
+  if not hasattr(np, _name):
+/home/jiang/master/idash/mpc/baseline/official_baseline_data.py:31: FutureWarning: In the future `np.str` will be defined as the corresponding NumPy scalar.
+  if not hasattr(np, _name):
+/home/jiang/master/idash/mpc/baseline/official_baseline_data.py:168: DeprecationWarning: an integer is required (got type numpy.float64).  Implicit conversion to integers using __int__ is deprecated, and may be removed in a future version of Python.
+  gcn.target = torch.LongTensor([target])
+/home/jiang/master/idash/mpc/baseline/official_baseline_data.py:168: UserWarning: Creating a tensor from a list of numpy.ndarrays is extremely slow. Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor. (Triggered internally at  ../torch/csrc/utils/tensor_new.cpp:204.)
+  gcn.target = torch.LongTensor([target])
+[davis] n=5010  MSE=0.1962  RMSE=0.4430  CI=0.9029  rm2=0.7263  Pearson=0.8697  Spearman=0.7164  AUPR=0.5096
+written: /home/jiang/master/idash/mpc/baseline/official_baseline_davis.json
