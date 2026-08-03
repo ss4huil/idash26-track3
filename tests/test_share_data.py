@@ -155,17 +155,25 @@ class TestBW32Shares:
 # Task 2: verify share-file naming contract matches C++ loader
 from reference import mpc_config
 
-def test_share_files_use_zero_based_cpp_names(tmp_path):
-    out = str(tmp_path)
-    share_drug_graph("CCO", out, bw=32, scale=12, seed=1)
-    for tensor in ("x", "adj", "mask"):
-        for party in (0, 1):
-            assert os.path.exists(os.path.join(out, mpc_config.share_filename(tensor, party)))
 
-def test_shares_reconstruct_to_fixed_point(tmp_path):
-    out = str(tmp_path)
-    share_drug_graph("CCO", out, bw=32, scale=12, seed=1)
-    s0 = np.fromfile(os.path.join(out, "x_share0.dat"), dtype="<u4")
-    s1 = np.fromfile(os.path.join(out, "x_share1.dat"), dtype="<u4")
-    recon = (s0.astype(np.uint64) + s1.astype(np.uint64)) % (1 << 32)
-    assert recon.dtype == np.uint64 and recon.size > 0
+class TestCppContract:
+    """Verify share files match the C++ loader contract (0-based, prefix-free)."""
+
+    def test_share_files_use_zero_based_cpp_names(self, tmp_path):
+        out = str(tmp_path)
+        share_drug_graph("CCO", out, bw=32, scale=12, seed=1)
+        for tensor in ("x", "adj", "mask"):
+            for party in (0, 1):
+                assert os.path.exists(os.path.join(out, mpc_config.share_filename(tensor, party)))
+
+    def test_shares_reconstruct_to_fixed_point(self, tmp_path):
+        # Break: bw=32 shares must reconstruct to the original graph via the
+        # real reconstruct() helper, exercising the 0-based naming contract.
+        from reference.dense_graph import smile_to_dense_graph
+        out = str(tmp_path)
+        share_drug_graph("CCO", out, bw=32, scale=12, seed=1)
+        X, _, _ = smile_to_dense_graph("CCO", 138)
+        s0 = np.fromfile(os.path.join(out, "x_share0.dat"), dtype="<u4")
+        s1 = np.fromfile(os.path.join(out, "x_share1.dat"), dtype="<u4")
+        recon = reconstruct(s0, s1, scale=12, bw=32).reshape(X.shape)
+        assert np.allclose(recon, X, atol=2.0 ** -12 * 4)
