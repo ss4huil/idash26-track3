@@ -1,20 +1,33 @@
 //
 // DeepDTAGen affinity path — 2PC inference driver (iDASH 2024 Track 3).
 //
-// Follows the structure of experiments/orca/orca_inference.cu: role 0 is the
-// dealer (FSS key generation), role 1 is the evaluator (online protocol). The
-// model graph is DeepDTAGenAffinity<T> (see deepdtagen.h).
+// Packaged after experiments/sigma/sigma_offline_online.cu: a single binary
+// with a `role` switch — role 0 is the dealer (FSS key generation written to
+// disk, the offline phase), role 1 is the evaluator (online protocol). The
+// crypto BACKEND is Orca (backend/orca.h), the only GPU-MPC backend providing
+// the relu / select / maxPool2D gates this graph needs; the SIGMA backend
+// lacks them, so we borrow only Sigma's offline/online *packaging*, not its
+// backend. The model graph is DeepDTAGenAffinity<T> (see deepdtagen.h).
 //
-// Inputs (produced by the Python side, all in fixed-point scale = 24, bw = 64):
-//   * X, A_hat, mask  : P1's drug-graph secret shares  (reference/share_data.py)
-//   * model weights   : P2's private weights blob       (reference/export_weights.py)
-//   * proteinEmb      : GatedCNN(protein) as a trivial share (public sequence)
+// Inputs (produced by the Python offline side, fixed-point scale = 12, bw = 32
+// — the Q20.12 ring proven to clear the accuracy gate; build BW=64 for a
+// 64-bit production ring). Ring element width = InfType (u32 for BW=32, u64
+// for BW=64), selected by the Makefile's -DInfType flag:
+//   * X, A_hat, mask : P0/P1 drug-graph secret shares  (reference/share_data.py)
+//       files {x,adj,mask}_share{0,1}.dat, headerless little-endian InfType,
+//       emitted by reference/offline_prepare.py
+//   * proteinEmb     : GatedCNN(protein) fixed-point constant, protein_emb.dat
+//       — public sequence, loaded on party 1 only (party 0 holds zero)
+//   * model weights  : public weights blob weights.bin (+ weights.bin.json
+//       sidecar), reference/export_weights.py. NOTE: the weight blob is int64
+//       REGARDLESS of the ring bw (export_weights hardcodes BITWIDTH=64), so
+//       the weight loader must read int64 even when shares are u32.
 //
-// BUILD/RUN BLOCKER (this environment): an RTX 4060 (CC 8.9) + driver are
-// present but there is NO nvcc/CUDA toolkit installed, so this file is
-// write-only here. Compile once the toolkit is available (from this dir):
-//     make GPU_MPC_ROOT=$HOME/EzPC/GPU-MPC GPU_ARCH=89 CUDA_VERSION=<ver> \
-//          deepdtagen_inference
+// BUILD/RUN (CUDA 12.1 toolkit installed at /usr/local/cuda-12.1; nvcc is not
+// on the login PATH — prepend it). From this dir, for the local RTX 4060
+// (SM 8.9), 32-bit ring:
+//     export PATH=/usr/local/cuda-12.1/bin:$PATH
+//     make GPU_MPC_ROOT=$HOME/EzPC/GPU-MPC BW=32 GPU_ARCH=89 deepdtagen_inference
 // The EzPC/GPU-MPC checkout is used strictly read-only (headers + util TUs).
 //
 #include <cassert>
@@ -33,8 +46,9 @@
 #define InfType u64
 #endif
 
-// Load a length-n fixed-point share file (headerless little-endian int64,
-// matching reference/share_data.py) into a host Tensor<InfType>.
+// Load a length-n fixed-point share file (headerless little-endian InfType —
+// u32 for BW=32, u64 for BW=64 — matching reference/share_data.py's bw mode)
+// into a host Tensor<InfType>.
 static void loadShare(const std::string &path, Tensor<InfType> &t)
 {
     std::ifstream f(path, std::ios::binary);
