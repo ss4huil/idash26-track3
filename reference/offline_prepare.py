@@ -35,12 +35,34 @@ def model_pth(dataset: str) -> str:
 
 def export_run_weights(dataset: str, out_dir: str,
                        scale: int = mpc_config.SCALE) -> str:
-    """Dump the shared fixed-point weight blob once per run; return its path."""
+    """Dump the shared fixed-point weight blob once per run; return its path.
+
+    Validates that a pre-existing blob was dumped with the requested scale;
+    raises ValueError on mismatch to prevent the manifest claiming a scale that
+    disagrees with the on-disk bytes.
+    """
+    import json
     os.makedirs(out_dir, exist_ok=True)
     weights_path = os.path.join(out_dir, WEIGHTS_FILE)
-    if not (os.path.exists(weights_path) and os.path.exists(weights_path + ".json")):
-        export_weights.dump_mpc_weights(AffinityModel.from_pth(model_pth(dataset)),
-                                        weights_path, scale=scale)
+    manifest_path = weights_path + ".json"
+
+    if os.path.exists(weights_path) and os.path.exists(manifest_path):
+        # validate scale matches the existing blob
+        with open(manifest_path) as f:
+            existing = json.load(f)
+        existing_scale = existing.get("scale")
+        if existing_scale != scale:
+            raise ValueError(
+                f"weights.bin scale mismatch: existing blob has scale={existing_scale}, "
+                f"but prepare_sample was called with scale={scale}. "
+                f"Remove {weights_path} to re-dump, or use a different out_dir for the new scale."
+            )
+        # scale matches; reuse the blob
+        return weights_path
+
+    # no existing blob or incomplete pair; dump fresh
+    export_weights.dump_mpc_weights(AffinityModel.from_pth(model_pth(dataset)),
+                                    weights_path, scale=scale)
     return weights_path
 
 

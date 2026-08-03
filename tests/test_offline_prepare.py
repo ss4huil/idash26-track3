@@ -49,7 +49,7 @@ def test_manifest_keys_and_row_fields(tmp_path):
 
 @_requires_data
 def test_weights_written_once_and_shares_sized_for_bw(tmp_path):
-    """weights.bin is reused across samples; share files match the ring width."""
+    """weights.bin is reused across samples with the SAME scale; share files match ring width."""
     m0 = op.prepare_sample("davis", DAVIS_CSV, row_idx=0, out_dir=str(tmp_path),
                            scale=12, bw=32)
     stamp = os.stat(m0["weights_path"]).st_mtime_ns
@@ -66,3 +66,11 @@ def test_weights_written_once_and_shares_sized_for_bw(tmp_path):
     assert os.path.getsize(mask0) == mpc_config.NMAX * mpc_config.POOL_DIM * 4
     pemb = os.path.join(m1["sample_dir"], mpc_config.PROTEIN_EMB_FILE)
     assert os.path.getsize(pemb) == 128 * 4
+
+
+@_requires_data
+def test_weights_scale_mismatch_raises(tmp_path):
+    """Calling prepare_sample twice into one out_dir with DIFFERENT scales raises ValueError."""
+    op.prepare_sample("davis", DAVIS_CSV, row_idx=0, out_dir=str(tmp_path), scale=12)
+    with pytest.raises(ValueError, match=r"weights\.bin scale mismatch.*scale=12.*scale=18"):
+        op.prepare_sample("davis", DAVIS_CSV, row_idx=1, out_dir=str(tmp_path), scale=18)
