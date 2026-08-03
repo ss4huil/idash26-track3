@@ -81,6 +81,10 @@ public:
     u64 in_feat;
     u64 out_feat;
 
+    // Stashed per-call so the two-arg forward() can route through SytorchModule's
+    // single-arg graph machinery (which calls the pure-virtual _forward below).
+    Tensor<T> *_a_hat = nullptr;
+
     GCNLayer(u64 in_feat_, u64 out_feat_)
         : in_feat(in_feat_), out_feat(out_feat_)
     {
@@ -89,12 +93,23 @@ public:
         lin = new FC<T>(in_feat, out_feat, /*useBias=*/true);
     }
 
-    // X (N x in_feat) and A_hat (N x N), both secret.
+    // Two-arg entry point used by DeepDTAGenAffinity::_forward.
+    // Stash A_hat then delegate to the base single-arg forward() so the sytorch
+    // graph framework records the node correctly.
     Tensor<T> &forward(Tensor<T> &X, Tensor<T> &A_hat)
     {
-        auto &AX  = matmul(A_hat, X);   // secret x secret        -> (N, in_feat)
-        auto &Z   = lin->forward(AX);   // AX @ W^T + b (P2 weights) -> (N, out)
-        auto &act = relu(Z);            // ReLU (>= 0)            -> (N, out)
+        _a_hat = &A_hat;
+        return SytorchModule<T>::forward(X);
+    }
+
+    // Pure-virtual override required by SytorchModule<T>.
+    // X (N x in_feat), _a_hat (N x N) — both secret.
+    Tensor<T> &_forward(Tensor<T> &X) override
+    {
+        assert(_a_hat != nullptr && "GCNLayer::_forward called without A_hat stash");
+        auto &AX  = matmul(*_a_hat, X);  // secret x secret        -> (N, in_feat)
+        auto &Z   = lin->forward(AX);    // AX @ W^T + b (P2 weights) -> (N, out)
+        auto &act = relu(Z);             // ReLU (>= 0)            -> (N, out)
         return act;
     }
 };
