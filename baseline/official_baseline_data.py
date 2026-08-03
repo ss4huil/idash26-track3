@@ -185,6 +185,14 @@ def build_dataset(dataset, csv_path, limit=None):
     return _build_from_df(df, tokenizer)
 
 
+def dataset_row(csv_path, row_idx):
+    """Read one test-CSV row's SMILES / protein sequence / affinity label."""
+    r = pd.read_csv(csv_path).iloc[row_idx]
+    return {"smile": str(r["compound_iso_smiles"]),
+            "protein_seq": str(r["target_sequence"]),
+            "y": float(r["affinity"])}
+
+
 def _resolve_device():
     """Pick CUDA only if it can actually launch a kernel.
 
