@@ -35,7 +35,7 @@ class TestSplitShares:
 
     def test_shares_are_uint64(self):
         x = np.array([0.1, 0.2, 0.3])
-        s1, s2 = split_shares(x, scale=SCALE, seed=1)
+        s1, s2 = split_shares(x, scale=SCALE, seed=1, bw=64)
         assert s1.dtype == np.uint64
         assert s2.dtype == np.uint64
 
@@ -48,7 +48,7 @@ class TestSplitShares:
 
     def test_additive_mod_2_64(self):
         x = np.array([-1.0, 7.0, -3.5], dtype=np.float64)
-        s1, s2 = split_shares(x, scale=SCALE, seed=3)
+        s1, s2 = split_shares(x, scale=SCALE, seed=3, bw=64)
         summed = (s1.astype(object) + s2.astype(object)) % U64_MOD
         fixed = (np.rint(x * (1 << SCALE)).astype(np.int64).astype(object)) % U64_MOD
         assert list(summed) == list(fixed)
@@ -62,46 +62,46 @@ class TestSplitShares:
 
 class TestShareDrugGraph:
     def test_writes_six_share_files(self, tmp_path):
-        prefix = str(tmp_path / "drug0")
-        share_drug_graph("CCO", prefix, scale=SCALE, nmax=138, seed=0)
+        out_dir = str(tmp_path)
+        share_drug_graph("CCO", out_dir, scale=SCALE, nmax=138, seed=0, bw=64)
         for tensor in ("x", "adj", "mask"):
-            assert os.path.exists(f"{prefix}_{tensor}_share1.dat")
-            assert os.path.exists(f"{prefix}_{tensor}_share2.dat")
+            assert os.path.exists(os.path.join(out_dir, f"{tensor}_share0.dat"))
+            assert os.path.exists(os.path.join(out_dir, f"{tensor}_share1.dat"))
 
     def test_reconstructed_x_matches_graph(self, tmp_path):
         from reference.dense_graph import smile_to_dense_graph
-        prefix = str(tmp_path / "d")
-        share_drug_graph("CC(=O)O", prefix, scale=SCALE, nmax=138, seed=5)
+        out_dir = str(tmp_path)
+        share_drug_graph("CC(=O)O", out_dir, scale=SCALE, nmax=138, seed=5, bw=64)
         X, A_hat, mask = smile_to_dense_graph("CC(=O)O", 138)
-        s1 = np.fromfile(f"{prefix}_x_share1.dat", dtype="<u8")
-        s2 = np.fromfile(f"{prefix}_x_share2.dat", dtype="<u8")
-        recon = reconstruct(s1, s2, scale=SCALE).reshape(X.shape)
+        s0 = np.fromfile(os.path.join(out_dir, "x_share0.dat"), dtype="<u8")
+        s1 = np.fromfile(os.path.join(out_dir, "x_share1.dat"), dtype="<u8")
+        recon = reconstruct(s0, s1, scale=SCALE, bw=64).reshape(X.shape)
         assert np.allclose(recon, X, atol=2.0 ** -SCALE * 4)
 
     def test_reconstructed_adj_matches(self, tmp_path):
         from reference.dense_graph import smile_to_dense_graph
-        prefix = str(tmp_path / "d")
-        share_drug_graph("c1ccccc1", prefix, scale=SCALE, nmax=138, seed=6)
+        out_dir = str(tmp_path)
+        share_drug_graph("c1ccccc1", out_dir, scale=SCALE, nmax=138, seed=6, bw=64)
         _, A_hat, _ = smile_to_dense_graph("c1ccccc1", 138)
-        s1 = np.fromfile(f"{prefix}_adj_share1.dat", dtype="<u8")
-        s2 = np.fromfile(f"{prefix}_adj_share2.dat", dtype="<u8")
-        recon = reconstruct(s1, s2, scale=SCALE).reshape(A_hat.shape)
+        s0 = np.fromfile(os.path.join(out_dir, "adj_share0.dat"), dtype="<u8")
+        s1 = np.fromfile(os.path.join(out_dir, "adj_share1.dat"), dtype="<u8")
+        recon = reconstruct(s0, s1, scale=SCALE, bw=64).reshape(A_hat.shape)
         assert np.allclose(recon, A_hat, atol=2.0 ** -SCALE * 4)
 
     def test_mask_is_emitted_pre_tiled(self, tmp_path):
         # C++ masked-max-pool multiplies mask*(H:(nmax,376)); sytorch _Mul
         # forbids broadcast, so the share must already be tiled (nmax, 376).
         from reference.dense_graph import smile_to_dense_graph
-        prefix = str(tmp_path / "d")
+        out_dir = str(tmp_path)
         POOL = 376
-        share_drug_graph("CC(=O)O", prefix, scale=SCALE, nmax=138,
-                         seed=7, pool_dim=POOL)
+        share_drug_graph("CC(=O)O", out_dir, scale=SCALE, nmax=138,
+                         seed=7, pool_dim=POOL, bw=64)
         _, _, mask = smile_to_dense_graph("CC(=O)O", 138)
         expected = np.broadcast_to(mask.reshape(138, 1), (138, POOL))
-        s1 = np.fromfile(f"{prefix}_mask_share1.dat", dtype="<u8")
-        s2 = np.fromfile(f"{prefix}_mask_share2.dat", dtype="<u8")
-        assert s1.size == 138 * POOL
-        recon = reconstruct(s1, s2, scale=SCALE).reshape(138, POOL)
+        s0 = np.fromfile(os.path.join(out_dir, "mask_share0.dat"), dtype="<u8")
+        s1 = np.fromfile(os.path.join(out_dir, "mask_share1.dat"), dtype="<u8")
+        assert s0.size == 138 * POOL
+        recon = reconstruct(s0, s1, scale=SCALE, bw=64).reshape(138, POOL)
         assert np.allclose(recon, expected, atol=2.0 ** -SCALE * 4)
         # every column is an identical copy of the (nmax,) node mask
         assert np.array_equal(recon[:, 0], recon[:, POOL - 1])
@@ -130,23 +130,42 @@ class TestBW32Shares:
 
     def test_share_drug_graph_bw32_file_size(self, tmp_path):
         # Break: bw=32 share files must be 4*N bytes (not 8*N).
-        prefix = str(tmp_path / "d")
-        share_drug_graph("CCO", prefix, scale=self.SCALE32, nmax=138,
+        out_dir = str(tmp_path)
+        share_drug_graph("CCO", out_dir, scale=self.SCALE32, nmax=138,
                          seed=0, bw=32)
         # X: (138, 94) → 138*94 = 12972 u32 elements → 51888 bytes
         expected_x = 138 * 94 * 4
-        actual = os.path.getsize(f"{prefix}_x_share1.dat")
+        actual = os.path.getsize(os.path.join(out_dir, "x_share0.dat"))
         assert actual == expected_x, \
-            f"bw=32 x_share1.dat: expected {expected_x} bytes, got {actual}"
+            f"bw=32 x_share0.dat: expected {expected_x} bytes, got {actual}"
 
     def test_share_drug_graph_bw32_reconstructed(self, tmp_path):
         # Break: reconstructed values must match the quantised graph within one LSB.
         from reference.dense_graph import smile_to_dense_graph
-        prefix = str(tmp_path / "d")
-        share_drug_graph("CC(=O)O", prefix, scale=self.SCALE32, nmax=138,
+        out_dir = str(tmp_path)
+        share_drug_graph("CC(=O)O", out_dir, scale=self.SCALE32, nmax=138,
                          seed=2, bw=32)
         X, _, _ = smile_to_dense_graph("CC(=O)O", 138)
-        s1 = np.fromfile(f"{prefix}_x_share1.dat", dtype="<u4")
-        s2 = np.fromfile(f"{prefix}_x_share2.dat", dtype="<u4")
-        recon = reconstruct(s1, s2, scale=self.SCALE32, bw=32).reshape(X.shape)
+        s0 = np.fromfile(os.path.join(out_dir, "x_share0.dat"), dtype="<u4")
+        s1 = np.fromfile(os.path.join(out_dir, "x_share1.dat"), dtype="<u4")
+        recon = reconstruct(s0, s1, scale=self.SCALE32, bw=32).reshape(X.shape)
         assert np.allclose(recon, X, atol=2.0 ** -self.SCALE32 * 4)
+
+
+# Task 2: verify share-file naming contract matches C++ loader
+from reference import mpc_config
+
+def test_share_files_use_zero_based_cpp_names(tmp_path):
+    out = str(tmp_path)
+    share_drug_graph("CCO", out, bw=32, scale=12, seed=1)
+    for tensor in ("x", "adj", "mask"):
+        for party in (0, 1):
+            assert os.path.exists(os.path.join(out, mpc_config.share_filename(tensor, party)))
+
+def test_shares_reconstruct_to_fixed_point(tmp_path):
+    out = str(tmp_path)
+    share_drug_graph("CCO", out, bw=32, scale=12, seed=1)
+    s0 = np.fromfile(os.path.join(out, "x_share0.dat"), dtype="<u4")
+    s1 = np.fromfile(os.path.join(out, "x_share1.dat"), dtype="<u4")
+    recon = (s0.astype(np.uint64) + s1.astype(np.uint64)) % (1 << 32)
+    assert recon.dtype == np.uint64 and recon.size > 0

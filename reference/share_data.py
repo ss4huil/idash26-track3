@@ -18,16 +18,18 @@ are NOT shared (P2 evaluates the GatedCNN on the cleartext protein and shares
 only the resulting Pvec at the fusion boundary).
 
 Shares are written as little-endian unsigned raw files, one pair per tensor:
-`<prefix>_<tensor>_share1.dat` and `<prefix>_<tensor>_share2.dat`.
+`<out_dir>/{tensor}_share{party}.dat` with party ∈ {0,1}.
 """
+import os
 import numpy as np
 
+from reference import mpc_config
 from reference.dense_graph import smile_to_dense_graph
 
 U64_MOD = 1 << 64
 U32_MOD = 1 << 32
-DEFAULT_SCALE = 24
-DEFAULT_BW = 64
+DEFAULT_SCALE = mpc_config.SCALE
+DEFAULT_BW = mpc_config.BW
 
 
 def _bw_dtype(bw: int):
@@ -82,16 +84,17 @@ def reconstruct(share1, share2, scale: int = DEFAULT_SCALE,
     return as_int.astype(np.float64) / (1 << scale)
 
 
-def _write_pair(x_float, prefix: str, tensor: str, scale: int, seed: int,
+def _write_pair(x_float, out_dir: str, tensor: str, scale: int, seed: int,
                 bw: int = DEFAULT_BW):
-    s1, s2 = split_shares(x_float, scale=scale, seed=seed, bw=bw)
+    s0, s1 = split_shares(x_float, scale=scale, seed=seed, bw=bw)
     nbytes = bw // 8
     dtype_str = f"<u{nbytes}"
-    s1.astype(dtype_str).tofile(f"{prefix}_{tensor}_share1.dat")
-    s2.astype(dtype_str).tofile(f"{prefix}_{tensor}_share2.dat")
+    os.makedirs(out_dir, exist_ok=True)
+    s0.astype(dtype_str).tofile(os.path.join(out_dir, mpc_config.share_filename(tensor, 0)))
+    s1.astype(dtype_str).tofile(os.path.join(out_dir, mpc_config.share_filename(tensor, 1)))
 
 
-def share_drug_graph(smile: str, out_prefix: str,
+def share_drug_graph(smile: str, out_dir: str,
                      scale: int = DEFAULT_SCALE, nmax: int = 138,
                      seed: int = 0, pool_dim: int = 376,
                      bw: int = DEFAULT_BW):
@@ -114,9 +117,9 @@ def share_drug_graph(smile: str, out_prefix: str,
     X, A_hat, mask = smile_to_dense_graph(smile, nmax)
     mask_tiled = np.broadcast_to(mask.reshape(nmax, 1),
                                  (nmax, pool_dim))          # (nmax, pool_dim)
-    _write_pair(X,          out_prefix, "x",    scale, seed + 0, bw=bw)
-    _write_pair(A_hat,      out_prefix, "adj",  scale, seed + 1, bw=bw)
-    _write_pair(mask_tiled, out_prefix, "mask", scale, seed + 2, bw=bw)
+    _write_pair(X,          out_dir, "x",    scale, seed + 0, bw=bw)
+    _write_pair(A_hat,      out_dir, "adj",  scale, seed + 1, bw=bw)
+    _write_pair(mask_tiled, out_dir, "mask", scale, seed + 2, bw=bw)
     return {"nmax": nmax, "scale": scale, "pool_dim": pool_dim, "bw": bw,
             "shapes": {"x": list(X.shape), "adj": list(A_hat.shape),
                        "mask": list(mask_tiled.shape)}}
