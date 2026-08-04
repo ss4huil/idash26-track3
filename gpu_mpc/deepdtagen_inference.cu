@@ -33,10 +33,12 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <omp.h>
 
 #include "backend/orca.h"
@@ -55,6 +57,91 @@ static void loadShare(const std::string &path, Tensor<InfType> &t)
     assert(f.good() && "missing share file");
     f.read((char *)t.data, t.size() * sizeof(InfType));
     assert(f.gcount() == (std::streamsize)(t.size() * sizeof(InfType)));
+}
+
+// ── int64 weight loader ────────────────────────────────────────────────────
+// Reads the headerless little-endian int64 blob produced by
+// reference/export_weights.py and fills the 9 FC layers of
+// DeepDTAGenAffinity in forward order.
+//
+// Blob layout (fixed — mirrors export_weights.py _MPC_GROUPS order):
+//   gcn.0   W(94,188)  b(188)
+//   gcn.1   W(188,282) b(282)
+//   gcn.2   W(282,376) b(376)
+//   drug_fc.0 W(376,1024) b(1024)
+//   drug_fc.1 W(1024,128) b(128)
+//   fusion.0  W(256,1024) b(1024)
+//   fusion.1  W(1024,512) b(512)
+//   fusion.2  W(512,256)  b(256)
+//   fusion.3  W(256,1)    b(1)
+//
+// Scaling:
+//   weights: stored at scale s  → fill directly: (InfType)(u64)w_i64[j]
+//   biases:  stored at scale s  → Orca matmul adds bias BEFORE the
+//            truncation node (TruncateType::None), so bias must be at
+//            scale 2s: (InfType)(u64)((i64)b_i64[j] << scale)
+//
+static void loadWeightsI64(DeepDTAGenAffinity<InfType> *model,
+                            const std::string &path, u64 scale)
+{
+    // Layer table in blob order: {FC pointer, in_features, out_features}
+    struct LayerSpec { FC<InfType> *fc; int in_feat; int out_feat; };
+    LayerSpec layers[] = {
+        { model->gcn1->lin, 94,   188  },
+        { model->gcn2->lin, 188,  282  },
+        { model->gcn3->lin, 282,  376  },
+        { model->dfc1,      376,  1024 },
+        { model->dfc2,      1024, 128  },
+        { model->ffc1,      256,  1024 },
+        { model->ffc2,      1024, 512  },
+        { model->ffc3,      512,  256  },
+        { model->fout,      256,  1    },
+    };
+    constexpr int N_LAYERS = 9;
+
+    // Compute total expected int64 elements for pre-check
+    size_t total_elems = 0;
+    for (int l = 0; l < N_LAYERS; l++)
+        total_elems += (size_t)layers[l].in_feat * layers[l].out_feat
+                     + (size_t)layers[l].out_feat;
+
+    // Read the entire blob into a vector
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.good()) {
+        fprintf(stderr, "[loadWeightsI64] Cannot open weights file: %s\n", path.c_str());
+        exit(1);
+    }
+    std::streamsize file_bytes = f.tellg();
+    f.seekg(0, std::ios::beg);
+    size_t n_elems = (size_t)file_bytes / sizeof(int64_t);
+    if (n_elems < total_elems) {
+        fprintf(stderr, "[loadWeightsI64] weights.bin too small: got %zu int64 elements, expected %zu\n",
+                n_elems, total_elems);
+        exit(1);
+    }
+    std::vector<int64_t> buf(n_elems);
+    f.read((char *)buf.data(), (std::streamsize)(n_elems * sizeof(int64_t)));
+
+    size_t offset = 0;
+    for (int l = 0; l < N_LAYERS; l++) {
+        int w_size = layers[l].in_feat * layers[l].out_feat;
+        int b_size = layers[l].out_feat;
+
+        // Fill weights: stored at scale s, use directly (low bw bits)
+        TensorRef<InfType> wref = layers[l].fc->getweights();
+        assert((int)wref.size == w_size && "weight size mismatch");
+        for (int j = 0; j < w_size; j++)
+            wref.data[j] = (InfType)(uint64_t)(int64_t)buf[offset + j];
+        offset += w_size;
+
+        // Fill biases: stored at scale s, must be at scale 2s for Orca matmul
+        TensorRef<InfType> bref = layers[l].fc->getbias();
+        assert((int)bref.size == b_size && "bias size mismatch");
+        for (int j = 0; j < b_size; j++)
+            bref.data[j] = (InfType)(uint64_t)((int64_t)buf[offset + j] << (int)scale);
+        offset += b_size;
+    }
+    printf("[loadWeightsI64] loaded %zu int64 elements from %s\n", offset, path.c_str());
 }
 
 int main(int argc, char *argv[])
@@ -86,8 +173,56 @@ int main(int argc, char *argv[])
     X.zero(); A_hat.zero(); maskTiled.zero(); proteinEmb.zero();
     model->setSample(&A_hat, &maskTiled, &proteinEmb);
 
+    // ── side-input graph-gen setup ──────────────────────────────────────────
+    // SytorchModule::init(scale, X) sets X.graphGenMode=true and creates X's
+    // PlaceHolder graphNode pointing to &allNodesInExecutionOrder.  But
+    // functionalGraphGen (used by matmul/mul/concat/etc.) fires
+    // always_assert(a->graphGenMode) for EVERY argument, so side-inputs that
+    // participate in functional ops (A_hat, maskTiled, proteinEmb) must also
+    // have graphGenMode=true and a valid graphNode before init() is called.
+    //
+    // We mirror exactly what genGraphAndExecutionOrder does for the primary
+    // input (module.h lines 106-116), and point allNodesInExecutionOrderRef
+    // at the same vector so the topological order is built consistently.
+    //
+    // currTensor must be set to the live host tensor so the execution loop
+    // (forward non-graph-gen path) can find the real data via
+    //   p->currTensor  for each parent p of a functional node.
+    {
+        auto *aref = &model->allNodesInExecutionOrder;
+        auto prepareSideInput = [&](Tensor<InfType> &t) {
+            t.graphGenMode = true;
+            t.graphNode    = new LayerGraphNode<InfType>();
+            t.graphNode->layer    = new PlaceHolderLayer<InfType>("Input");
+            t.graphNode->currTensor = &t;           // execution: live data lives here
+            t.graphNode->allNodesInExecutionOrderRef = aref;
+        };
+        prepareSideInput(A_hat);
+        prepareSideInput(maskTiled);
+        prepareSideInput(proteinEmb);
+    }
+
     model->init(scale, X);
+
+    // genGraphAndExecutionOrder resets X.graphGenMode=false at line 115 of
+    // module.h, but it never touches the side-inputs.  Reset them now so the
+    // execution path doesn't confuse them with graph-gen tensors.
+    A_hat.graphGenMode    = false;
+    maskTiled.graphGenMode = false;
+    proteinEmb.graphGenMode = false;
+
     model->zero();
+
+    // Load trained weights from the int64 blob produced by reference/export_weights.py.
+    // Path is taken from env var DDG_WEIGHTS_BIN; falls back to ./weights.bin.
+    // Loading on BOTH dealer and evaluator: dealer needs only shapes (harmless to load);
+    // evaluator needs real values for correct arithmetic.
+    // MUST run AFTER model->zero() so loaded values are not wiped.
+    {
+        const char *wenv = getenv("DDG_WEIGHTS_BIN");
+        std::string wpath = (wenv && wenv[0]) ? std::string(wenv) : std::string("./weights.bin");
+        loadWeightsI64(model, wpath, scale);
+    }
 
     auto expName = std::string("DeepDTAGen_") + std::to_string(bw) + "_" + std::to_string(scale);
     auto keyFileName = keyDir + expName;
@@ -126,6 +261,7 @@ int main(int argc, char *argv[])
         u64 commBytes = 0;
         lseek(fss->fd, 0, SEEK_SET);
         readKey(fss->fd, fss->keySize, fss->startPtr, NULL);
+        Tensor<InfType> *out_ptr = nullptr;   // capture last forward output
         for (int i = 0; i < 11; i++)
         {
             fss->keyBuf = fss->startPtr;
@@ -136,6 +272,7 @@ int main(int argc, char *argv[])
             X.d_data = (InfType *)moveToGPU((u8 *)X.data, X.size() * sizeof(InfType), &(fss->s));
             auto &out = model->forward(X);
             fss->output(out);
+            out_ptr = &out;   // model holds this tensor; stable across iters
             auto end = std::chrono::high_resolution_clock::now();
             if (i > 0)
                 times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
@@ -147,6 +284,16 @@ int main(int argc, char *argv[])
         auto avgTime = std::reduce(times.begin(), times.end()) / (float)times.size();
         printf("Average time taken (microseconds)=%f\n", avgTime);
         printf("Comm (B)=%lu\n", commBytes);
+
+        // Reveal the final affinity scalar.
+        // fss->output() reconstructs shares onto party 0's host tensor.
+        // Party 0 prints; party 1 stays silent to avoid duplicate output.
+        if (party == 0 && out_ptr != nullptr) {
+            // Reinterpret the ring value as signed int32, divide by 2^scale.
+            int32_t sv = (int32_t)(uint32_t)(uint64_t)out_ptr->data[0];
+            double  aff = (double)sv / (double)(1LL << scale);
+            printf("AFFINITY=%.6f\n", aff);
+        }
     }
     return 0;
 }

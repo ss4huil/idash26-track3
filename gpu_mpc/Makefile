@@ -63,7 +63,8 @@ endif
 FLAGS := -O3 $(GENCODE) -std=c++17 -m64 \
          -DInfType=$(if $(filter 32,$(BW)),u32,u64) \
          -DBW=$(BW) \
-         -Xcompiler="-O3,-w,-std=c++17,-fpermissive,-fpic,-pthread,-fopenmp,-march=native"
+         -Xcompiler="-O3,-w,-std=c++17,-fpermissive,-fpic,-pthread,-fopenmp,-march=native" \
+         -Xlinker=--wrap=initGPUMemPool
 LIBS  := -lsytorch -lcryptoTools -lLLAMA -lbitpack -lcuda -lcudart -lcurand
 
 # ── include / link paths ──────────────────────────────────────────────────────
@@ -86,9 +87,17 @@ INCLUDES     := $(OBJ_INCLUDES) \
                 -L$(SYTORCH_BUILD_PATH)/lib
 
 # ── targets ───────────────────────────────────────────────────────────────────
-deepdtagen_inference: deepdtagen_inference.cu deepdtagen.h gcn_layer.h masked_maxpool.h
-	$(CXX) $(FLAGS) $(INCLUDES) $(HERE)/deepdtagen_inference.cu $(UTIL_FILES) $(LIBS) \
+# pool_override.o: replaces initGPUMemPool() to skip the 40GiB warmup probe
+# that OOMs on RTX 4060 (8 GiB).  Compiled with plain gcc so the __wrap_
+# symbol lands in the object as a standard C extern.
+pool_override.o: pool_override.c
+	gcc -O2 -fPIC -I/usr/local/cuda-$(CUDA_VERSION)/include \
+	    -c $(HERE)/pool_override.c -o $(HERE)/pool_override.o
+
+deepdtagen_inference: deepdtagen_inference.cu deepdtagen.h gcn_layer.h masked_maxpool.h pool_override.o
+	$(CXX) $(FLAGS) $(INCLUDES) $(HERE)/deepdtagen_inference.cu $(UTIL_FILES) \
+	    $(HERE)/pool_override.o $(LIBS) \
 	    -o $(HERE)/deepdtagen_inference
 
 clean:
-	rm -f $(HERE)/deepdtagen_inference
+	rm -f $(HERE)/deepdtagen_inference $(HERE)/pool_override.o
