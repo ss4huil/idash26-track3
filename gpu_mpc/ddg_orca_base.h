@@ -1,0 +1,622 @@
+// Forked from EzPC/GPU-MPC backend/orca_base.h (commit 66d9cddc, Aug 2024)
+// Extended for DeepDTAGen graph model: added mul()/scalarmul() methods for
+// element-wise secret×secret and public-scalar multiplication (GCN + MaskedMaxPool).
+// Also: keyBufSize capped to 2 GiB (upstream 20 GiB OOMs on 7.6 GiB WSL2 box).
+//
+// Original Authors: Neha Jawalkar
+// Copyright (c) 2024 Microsoft Research
+// Licensed under MIT (see original file header for full text).
+//
+// Modifications Copyright (c) 2026 iDASH Track 3 submission team.
+
+#pragma once
+
+#include <omp.h>
+#include <cstdlib>
+#include <set>
+
+#include <sytorch/backend/backend.h>
+#include <sytorch/backend/llama_base.h>
+#include <llama/comms.h>
+#include <llama/api.h>
+
+#include "ddg_orca_opt.h"
+
+#include "utils/gpu_random.h"
+#include "utils/gpu_mem.h"
+
+#include "fss/gpu_matmul.h"
+#include "fss/gpu_conv2d.h"
+#include "fss/gpu_relu.h"
+#include "fss/gpu_maxpool.h"
+#include "fss/gpu_avgpool.h"
+#include "fss/gpu_add.h"
+#include "fss/gpu_mul.h"
+#include "fss/gpu_scalarmul.h"
+
+// ── DIAGNOSTIC: KeyBuf hash checkpoint for nondeterminism debugging ──────────
+static inline void logKeyBufHash(const char *label, u8 *startPtr, u8 *keyBuf) {
+    size_t size = keyBuf - startPtr;
+    uint32_t hash = 0x12345678;
+    // Hash last 64KB or full buffer if smaller (avoid scanning 175MB every time)
+    size_t scan_size = (size > 65536) ? 65536 : size;
+    u8 *scan_start = keyBuf - scan_size;
+    for (size_t i = 0; i < scan_size; i++)
+        hash = hash * 31 + scan_start[i];
+    fprintf(stderr, "  [KBHASH] %s: offset=%zu MB, tail64k_hash=0x%08x\n",
+            label, size/(1024*1024), hash);
+    fflush(stderr);
+}
+
+template <typename T>
+class DDGOrcaBase : public Backend<T>
+{
+public:
+    u8 *startPtr = NULL;
+    u8 *keyBuf = NULL;
+    size_t keySize = 0;
+    int fd = -1;
+    GpuPeer *peer = NULL;
+    int party = -1;
+    Stats s;
+    int bw;
+    int scale;
+    AESGlobalContext g;
+
+    // DEPRECATED: sxsMatmulIdx was used by the old reveal-once heuristic.
+    // Now unused (Sigma-native SxS matmul has no reveal step), but kept for
+    // backward compat with inference.cu:294 reset line.
+    int sxsMatmulIdx = 0;
+
+    // Sigma-native leaf tracking: register secret leaves before each forward pass,
+    // reveal each on first use. Intermediates are already masked-public from their
+    // source ops, so only leaves need explicit reveal.
+    std::set<void*> unrevealedLeaves;
+
+    void registerLeaf(void *d_ptr) {
+        unrevealedLeaves.insert(d_ptr);
+    }
+
+    void resetLeaves() {
+        unrevealedLeaves.clear();
+    }
+
+    // Reveal helper: if d_data is an unrevealed leaf, add mask and reconstruct.
+    // Returns true if revealed, false if already masked-public (intermediate or pre-revealed leaf).
+    bool revealIfLeaf(T *d_data, T *d_mask, int bw, u64 size) {
+        if (unrevealedLeaves.count(d_data)) {
+            gpuLinearComb(bw, size, d_data, T(1), d_data, T(1), d_mask);
+            peer->reconstructInPlace(d_data, bw, size, &s);
+            unrevealedLeaves.erase(d_data);
+            return true;
+        }
+        return false;
+    }
+
+    // Reveal public leaf: reconstruct additive share (no mask, just reconstruct).
+    // Use for proteinEmb (party0=0, party1=P, r=0) → P on both parties.
+    void revealPublicLeaf(T *d_data, int bw, u64 size) {
+        if (unrevealedLeaves.count(d_data)) {
+            peer->reconstructInPlace(d_data, bw, size, &s);
+            unrevealedLeaves.erase(d_data);
+        }
+    }
+
+    DDGOrcaBase() {}
+
+    DDGOrcaBase(int party, std::string ip, int bw, int scale, std::string keyFile = "", bool compress = true) : party(party), bw(bw), scale(scale)
+    {
+        initAESContext(&g);
+        initGPUMemPool();
+        if (keyFile.compare("") != 0)
+        {
+            auto filename = keyFile + "_inference_key" + std::to_string(party) + ".dat";
+            keySize = std::filesystem::file_size(filename);
+            fd = openForReading(filename);
+            // FIX: disable pinning for eval — 2 concurrent parties on 8GB GPU OOM
+            getAlignedBuf(&keyBuf, keySize, false);
+            startPtr = keyBuf;
+        }
+        peer = new GpuPeer(compress);
+        peer->connect(party, ip);
+    }
+
+    void close()
+    {
+        peer->close();
+    }
+
+    void conv2D(u64 fh, u64 fw, u64 padding, u64 stride, u64 ci, u64 co, const Tensor4D<T> &input, const Tensor2D<T> &filter, bool useBias, const Tensor1D<T> &bias, Tensor4D<T> &output, bool isFirst)
+    {
+        auto comm_start = s.comm_time;
+        auto start = std::chrono::high_resolution_clock::now();
+        GPUConv2DKey<T> k;
+        k.p = {
+            bw, bw, (int)input.d1, (int)input.d2, (int)input.d3, (int)ci,
+            (int)fh, (int)fw, (int)co, (int)padding, (int)padding, (int)padding, (int)padding,
+            (int)stride, (int)stride, 0, 0, 0, 0, 0};
+        fillConv2DParams(&(k.p));
+        k.mem_size_I = k.p.size_I * sizeof(T);
+        k.mem_size_F = k.p.size_F * sizeof(T);
+        k.mem_size_O = k.p.size_O * sizeof(T);
+
+        k.I = (T *)keyBuf;
+        keyBuf += k.mem_size_I;
+        k.F = (T *)keyBuf;
+        keyBuf += k.mem_size_F;
+        k.O = (T *)keyBuf;
+        keyBuf += k.mem_size_O;
+
+        auto d_mask_I = (T *)moveToGPU((u8 *)k.I, k.mem_size_I, &s);
+        if (isFirst)
+        {
+            gpuLinearComb(bw, k.p.size_I, input.d_data, T(1), input.d_data, T(1), d_mask_I);
+            peer->reconstructInPlace(input.d_data, bw, k.p.size_I, &s);
+        }
+        auto d_F = (T *)moveToGPU((u8 *)filter.data, k.mem_size_F, &s);
+        auto d_mask_F = (T *)moveToGPU((u8 *)k.F, k.mem_size_F, &s);
+        auto d_C = gpuConv2DBeaver<T>(k, party, input.d_data, d_F, d_mask_I, d_mask_F, useBias && party == SERVER0 ? bias.data : (T *)NULL, &s, 0);
+
+        gpuFree(d_F);
+        gpuFree(d_mask_I);
+        gpuFree(d_mask_F);
+        peer->reconstructInPlace(d_C, k.p.bout, k.p.size_O, &s);
+        output.d_data = d_C;
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = end - start;
+        s.conv_time += std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+        auto comm_end = s.comm_time;
+        s.conv_comm_time += (comm_end - comm_start);
+    }
+
+    // ── 3-arg matmul: secret×secret (eval, SIGMA NATIVE) ────────────────────
+    // Returns MASKED-PUBLIC output. Truncation handled by _MatMul's doTruncationForward.
+    // Inputs a.d_data, b.d_data are SHARES that get revealed to masked-public.
+    void matmul(const Tensor2D<T> &a, const Tensor2D<T> &b, Tensor2D<T> &c)
+    {
+        auto comm_start = s.comm_time;
+        auto start = std::chrono::high_resolution_clock::now();
+
+        MatmulParams p;
+        p.M = a.d1;
+        p.K = a.d2;
+        p.N = b.d2;
+        p.batchSz = 1;
+        stdInit(p, bw, 0);  // Truncation by _MatMul's doTruncationForward=true node
+
+        auto k = readGPUMatmulKey<T>(p, TruncateType::None, &keyBuf);
+
+        // Load mask share for operand A (gpuMatmul reloads k.B internally).
+        T *d_mask_A = (T *)moveToGPU((u8 *)k.A, k.mem_size_A, &s);
+        T *d_mask_B = (T *)moveToGPU((u8 *)k.B, k.mem_size_B, &s);
+
+        // Reveal inputs if they're leaves (first use). After reveal, both parties
+        // hold the masked-public value (e.g., X + r_X). Intermediates are already
+        // masked-public (previous matmul reconstructed + truncated them).
+        revealIfLeaf(a.d_data, d_mask_A, bw, p.size_A);
+        revealIfLeaf(b.d_data, d_mask_B, bw, p.size_B);
+        gpuFree(d_mask_B);  // gpuMatmul reloads k.B internally as d_mask_W
+
+        // gpuMatmul-full: Beaver + reconstruct (no internal truncate; _MatMul node does it).
+        // Returns MASKED-PUBLIC (A·B) with output mask r_Z baked in. Scale = 2s.
+        c.d_data = gpuMatmul(peer, party, p, k, a.d_data, b.d_data, (T *)NULL,
+                             TruncateType::None, &g, &s, /*wIsOnGpu=*/true, d_mask_A);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = end - start;
+        s.matmul_time += std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+        auto comm_end = s.comm_time;
+        s.matmul_comm_time += (comm_end - comm_start);
+    }
+
+    // ── 4-arg matmul: secret×public (FC layers, with M=1 padding fix) ──────
+    void matmul(const Tensor2D<T> &a, const Tensor2D<T> &b, Tensor2D<T> &c, bool useBias, Tensor1D<T> &d, bool isFirst)
+    {
+        auto comm_start = s.comm_time;
+        auto start = std::chrono::high_resolution_clock::now();
+        fprintf(stderr, "[eval matmul SxP] M=%d K=%d N=%d isFirst=%d a.d_data=%p keyBuf_offset=%zu MB\n",
+                (int)a.d1, (int)a.d2, (int)b.d2, (int)isFirst, (void*)a.d_data,
+                (size_t)(keyBuf - startPtr) / (1024*1024)); fflush(stderr);
+
+        // CUTLASS fails with M=1 for integer GEMMs. Pad to M=128 to match keygen.
+        if (a.d1 == 1) {
+            const int M_PADDED = 128;
+            const u64 padded_size_A = M_PADDED * a.d2;
+            T *d_A_padded = (T *)gpuMalloc(padded_size_A * sizeof(T));
+            checkCudaErrors(cudaMemcpy(d_A_padded, a.d_data, a.d2 * sizeof(T), cudaMemcpyDeviceToDevice));
+            checkCudaErrors(cudaMemset(d_A_padded + a.d2, 0, (M_PADDED - 1) * a.d2 * sizeof(T)));
+
+            MatmulParams p;
+            p.M = M_PADDED;
+            p.K = a.d2;
+            p.N = b.d2;
+            p.batchSz = 1;
+            stdInit(p, bw, 0);  // FC truncation handled by separate truncateForward node
+            auto k = readGPUMatmulKey<T>(p, TruncateType::None, &keyBuf);
+
+            auto d_mask_A = (T *)moveToGPU((u8 *)k.A, k.mem_size_A, &s);
+            if (std::getenv("DDG_DUMP_MM")) {
+                if (a.d1 == 1 && a.d2 == 1024) {
+                    T *h_in = (T *)malloc(5 * sizeof(T));
+                    T *h_ka = (T *)malloc(5 * sizeof(T));
+                    checkCudaErrors(cudaMemcpy(h_in, d_A_padded, 5 * sizeof(T), cudaMemcpyDeviceToHost));
+                    checkCudaErrors(cudaMemcpy(h_ka, d_mask_A,    5 * sizeof(T), cudaMemcpyDeviceToHost));
+                    fprintf(stderr, "[eval d2-MM DUMP] party=%d M=%d K=%d N=%d\n", party, (int)a.d1, (int)a.d2, (int)b.d2);
+                    fprintf(stderr, "  masked_in[0..4]=%lld,%lld,%lld,%lld,%lld\n",
+                            (long long)(int64_t)h_in[0],(long long)(int64_t)h_in[1],(long long)(int64_t)h_in[2],(long long)(int64_t)h_in[3],(long long)(int64_t)h_in[4]);
+                    fprintf(stderr, "  k.A_share[0..4]=%lld,%lld,%lld,%lld,%lld\n",
+                            (long long)(int64_t)h_ka[0],(long long)(int64_t)h_ka[1],(long long)(int64_t)h_ka[2],(long long)(int64_t)h_ka[3],(long long)(int64_t)h_ka[4]);
+                    free(h_in); free(h_ka);
+                }
+            }
+            // Leaf reveal on the ORIGINAL (unpadded) leaf pointer a.d_data. The
+            // pad copies row 0 into d_A_padded, so reveal a.d_data first then copy.
+            if (isFirst || unrevealedLeaves.count(a.d_data))
+            {
+                // Reveal padded operand (mask covers M=128 rows; row0 is the leaf).
+                gpuLinearComb(bw, p.size_A, d_A_padded, T(1), d_A_padded, T(1), d_mask_A);
+                peer->reconstructInPlace(d_A_padded, bw, p.size_A, &s);
+                unrevealedLeaves.erase(a.d_data);
+            }
+            T *d_C_padded = gpuMatmul(peer, party, p, k, d_A_padded, b.data, useBias ? d.data : (T *)NULL, TruncateType::None, &g, &s, false, d_mask_A);
+
+            // Extract row 0 from padded output
+            c.d_data = (T *)gpuMalloc(b.d2 * sizeof(T));
+            checkCudaErrors(cudaMemcpy(c.d_data, d_C_padded, b.d2 * sizeof(T), cudaMemcpyDeviceToDevice));
+
+            gpuFree(d_A_padded);
+            gpuFree(d_C_padded);
+        } else {
+            MatmulParams p;
+            p.M = a.d1;
+            p.K = a.d2;
+            p.N = b.d2;
+            p.batchSz = 1;
+            stdInit(p, bw, 0);  // FC truncation handled by separate truncateForward node
+            auto k = readGPUMatmulKey<T>(p, TruncateType::None, &keyBuf);
+
+            auto d_mask_A = (T *)moveToGPU((u8 *)k.A, k.mem_size_A, &s);
+            if (std::getenv("DDG_DUMP_FC_MASK") && a.d1==138 && a.d2==94) {
+                T *h_ka = (T*)malloc(5*sizeof(T));
+                checkCudaErrors(cudaMemcpy(h_ka, d_mask_A, 5*sizeof(T), cudaMemcpyDeviceToHost));
+                fprintf(stderr, "  [EVAL FC k.A] party=%d k.A[0..4]=%lld,%lld,%lld,%lld,%lld\n",
+                        party, (long long)(int64_t)h_ka[0],(long long)(int64_t)h_ka[1],
+                        (long long)(int64_t)h_ka[2],(long long)(int64_t)h_ka[3],(long long)(int64_t)h_ka[4]);
+                free(h_ka);
+            }
+            if (isFirst || unrevealedLeaves.count(a.d_data))
+            {
+                gpuLinearComb(bw, p.size_A, a.d_data, T(1), a.d_data, T(1), d_mask_A);
+                peer->reconstructInPlace(a.d_data, bw, p.size_A, &s);
+                unrevealedLeaves.erase(a.d_data);
+            }
+            c.d_data = gpuMatmul(peer, party, p, k, a.d_data, b.data, useBias ? d.data : (T *)NULL, TruncateType::None, &g, &s, false, d_mask_A);
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto elapsed = end - start;
+        s.matmul_time += std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+        auto comm_end = s.comm_time;
+        s.matmul_comm_time += (comm_end - comm_start);
+    }
+
+    // ── ADDED: element-wise secret×secret multiply (eval) ───────────────────
+    virtual void mul(const Tensor<T> &a, const Tensor<T> &b, Tensor<T> &out)
+    {
+        // Override in derived class (DDGOrca)
+        throw std::runtime_error("mul() not implemented in DDGOrcaBase");
+    }
+
+    // ── ADDED: public-scalar multiply (eval) ────────────────────────────────
+    virtual void scalarmul(Tensor<T> &x, T scalar, Tensor<T> &y)
+    {
+        // Override in derived class (DDGOrca)
+        throw std::runtime_error("scalarmul() not implemented in DDGOrcaBase");
+    }
+
+    void avgPool2D(u64 ks, u64 padding, u64 stride, const Tensor4D<T> &in, Tensor4D<T> &out, u64 scale)
+    {
+        AvgPoolParams p = {
+            bw, bw, (int)scale, (int)scale, 0, (int)in.d1, (int)in.d2, (int)in.d3, (int)in.d4,
+            (int)ks, (int)ks, (int)stride, (int)stride, (int)padding, (int)padding, (int)padding, (int)padding, 0, 0, false};
+        initPoolParams(p);
+        out.d_data = gpuAddPool(p, in.d_data, &s);
+    }
+
+    void output(Tensor<T> &a)
+    {
+        int N = a.size();
+        if (std::getenv("DDG_DUMP_OUTPUT")) {
+            T *h_masked = (T *)malloc(N * sizeof(T));
+            checkCudaErrors(cudaMemcpy(h_masked, a.d_data, N * sizeof(T), cudaMemcpyDeviceToHost));
+            T *h_mask = (T *)keyBuf;  // keyBuf holds this party's r_Z share
+            fprintf(stderr, "[eval output DUMP] party=%d N=%d\n", party, N);
+            for (int j = 0; j < 5 && j < N; j++)
+                fprintf(stderr, "  [%d] masked_Z=%lld  mask(r_Z)=%lld  diff=%lld\n",
+                        j, (long long)(int64_t)h_masked[j], (long long)(int64_t)h_mask[j],
+                        (long long)(int64_t)(h_masked[j] - h_mask[j]));
+            free(h_masked);
+        }
+        unmaskValues(bw, N, a.d_data, (T *)keyBuf, &s);
+        // DEBUG: skip the final scale-truncation when revealing an intermediate
+        // node (e.g. the pooled vector) that is already at scale `scale`.
+        if (std::getenv("DDG_NO_OUTPUT_TR") && std::atoi(std::getenv("DDG_NO_OUTPUT_TR")) == 1) {
+            moveIntoCPUMem((u8 *)a.data, (u8 *)a.d_data, N * sizeof(T), &s);
+            return;
+        }
+        gpuLocalTr<T, T, ars>(party, bw, scale, N, a.d_data, true);
+        moveIntoCPUMem((u8 *)a.data, (u8 *)a.d_data, N * sizeof(T), &s);
+    }
+
+    void add(const std::vector<Tensor<T> *> &in, Tensor<T> &out)
+    {
+        int tmpBw = bw - scale;
+        int N = in[0]->size();
+        std::vector<T *> gpuInp;
+        for (int i = 0; i < in.size(); i++)
+        {
+            gpuInp.push_back(in[i]->d_data);
+        }
+        out.d_data = gpuAdd(tmpBw, N, gpuInp);
+    }
+
+    void optimize(LayerGraphNode<T> *root)
+    {
+        topologicalApply(root, [&](LayerGraphNode<T> *n, LayerGraphNode<T> *r)
+                         { ddgOrcaOpt<T>(n, r); });
+        topologicalApply(root, [&](LayerGraphNode<T> *n, LayerGraphNode<T> *r)
+                         { pinCpuMem(n, r); });
+    }
+};
+
+template <typename T>
+class DDGOrcaBaseKeygen : public Backend<T>
+{
+public:
+    u8 *startPtr;
+    u8 *keyBuf = NULL;
+    size_t keyBufSize = 0;
+    int party = -1;
+    std::string keyFile;
+    int scale;
+    int bw;
+    AESGlobalContext g;
+
+    DDGOrcaBaseKeygen(int party, int bw, int scale, std::string keyFile) : party(party), bw(bw), scale(scale), keyFile(keyFile)
+    {
+        initAESContext(&g);
+        initGPURandomness();
+        initCPURandomness();
+        initGPUMemPool();
+
+        // ── MODIFIED: cap keyBufSize to fit in WSL2 box RAM ─────────────────
+        // Upstream hardcodes 20 GiB; this WSL2 box has 7.6 GiB total.
+        // This model's real keys are << 1 GiB (small batch-1 FCs, 3 GCN layers).
+        // Cap at 2 GiB with env override: DDG_KEYBUF_CAP_GB.
+        const char *cap_env = std::getenv("DDG_KEYBUF_CAP_GB");
+        size_t cap_gb = cap_env ? std::atoi(cap_env) : 2;
+        keyBufSize = std::min(20UL * OneGB, cap_gb * OneGB);
+
+        getAlignedBuf(&keyBuf, keyBufSize, true);
+        startPtr = keyBuf;
+    }
+
+    void close()
+    {
+        size_t keySize = keyBuf - startPtr;
+        size_t padding = 4096 - (keySize % 4096);
+        char *zeros = new char[padding];
+        memset(zeros, 0, padding);
+        memcpy(keyBuf, zeros, padding);
+        keyBuf += padding;
+        keySize += padding;
+        fprintf(stderr, "[close] keySize before padding=%zu MB, after padding=%zu MB\n",
+                (keyBuf - startPtr - padding)/(1024*1024), keySize/(1024*1024)); fflush(stderr);
+        assert(keySize < keyBufSize && "Key buffer overflow — raise DDG_KEYBUF_CAP_GB");
+        int fd = openForWriting(keyFile + "_inference_key" + std::to_string(party) + ".dat");
+        writeKeyBuf(fd, keySize, startPtr);
+        fprintf(stderr, "[close] wrote %zu MB to %s\n", keySize/(1024*1024),
+                (keyFile + "_inference_key" + std::to_string(party) + ".dat").c_str()); fflush(stderr);
+        assert(0 == fsync(fd) && "sync error!");
+        closeFile(fd);
+        cpuFree(startPtr, true);
+        destroyGPURandomness();
+        destroyCPURandomness();
+    }
+
+    void conv2D(u64 fh, u64 fw, u64 padding, u64 stride, u64 ci, u64 co, const Tensor4D<T> &input, const Tensor2D<T> &filter, Tensor4D<T> &output, bool isFirst)
+    {
+        GPUConv2DKey<T> k;
+        k.p = {
+            bw, bw, (int)input.d1, (int)input.d2, (int)input.d3, (int)ci,
+            (int)fh, (int)fw, (int)co, (int)padding, (int)padding, (int)padding, (int)padding,
+            (int)stride, (int)stride, 0, 0, 0, 0, 0};
+        fillConv2DParams(&(k.p));
+        k.mem_size_I = k.p.size_I * sizeof(T);
+        k.mem_size_F = k.p.size_F * sizeof(T);
+        k.mem_size_O = k.p.size_O * sizeof(T);
+        output.d_data = gpuKeygenConv2D<T>(&keyBuf, party, k, input.d_data, filter.data, true);
+    }
+
+    // ── 3-arg matmul: secret×secret (FIXED from upstream bug) ──────────────
+    // Upstream Orca/SIGMA incorrectly pass b.data (host ptr) to gpuKeygenMatmul,
+    // treating the 2nd operand as public. For GCN's A_hat @ X (both secret),
+    // we must pass b.d_data (GPU ptr) with wIsOnGpu=true.
+    void matmul(const Tensor2D<T> &a, const Tensor2D<T> &b, Tensor2D<T> &c)
+    {
+        fprintf(stderr, "[keygen matmul SECRET×SECRET] a=(%d,%d) b=(%d,%d) a.d_data=%p b.d_data=%p\n",
+                a.d1, a.d2, b.d1, b.d2, (void*)a.d_data, (void*)b.d_data); fflush(stderr);
+        fprintf(stderr, "  sizes: a=%zu b=%zu c_expected=%zu bytes\n",
+                a.d1*a.d2*sizeof(T), b.d1*b.d2*sizeof(T), a.d1*b.d2*sizeof(T)); fflush(stderr);
+        MatmulParams p;
+        p.M = a.d1;
+        p.K = a.d2;
+        p.N = b.d2;
+        p.batchSz = 1;
+        stdInit(p, bw, 0);  // Truncation by _MatMul's doTruncationForward=true node
+        fprintf(stderr, "  calling gpuKeygenMatmul...\n"); fflush(stderr);
+        // Pass b.d_data (GPU ptr) with wIsOnGpu=true instead of b.data (host ptr)
+        c.d_data = gpuKeygenMatmul<T>(&keyBuf, party, p, a.d_data, b.d_data, (T *)NULL, TruncateType::None, &g, true);
+        { cudaError_t e = cudaDeviceSynchronize();
+          fprintf(stderr, "  gpuKeygenMatmul returned c.d_data=%p, sync=%s\n",
+                  (void*)c.d_data, cudaGetErrorString(e)); fflush(stderr); }
+        logKeyBufHash("after SECRET×SECRET matmul", startPtr, keyBuf);
+    }
+
+    // ── 4-arg matmul: secret×public (FC layers, with M=1 padding fix) ──────
+    void matmul(const Tensor2D<T> &a, const Tensor2D<T> &b, Tensor2D<T> &c, bool useBias, Tensor1D<T> &d, bool isFirst)
+    {
+        fprintf(stderr, "[keygen matmul SECRET×PUBLIC] a=(%d,%d) b=(%d,%d) a.d_data=%p b.data=%p\n",
+                a.d1, a.d2, b.d1, b.d2, (void*)a.d_data, (void*)b.data); fflush(stderr);
+        if (std::getenv("DDG_DUMP_FC_MASK") && a.d1==138 && a.d2==94) {
+            T *h_mask = (T*)malloc(5*sizeof(T));
+            checkCudaErrors(cudaMemcpy(h_mask, a.d_data, 5*sizeof(T), cudaMemcpyDeviceToHost));
+            fprintf(stderr, "  [KEYGEN FC INPUT MASK] party=%d a.d_data[0..4]=%lld,%lld,%lld,%lld,%lld\n",
+                    party, (long long)(int64_t)h_mask[0],(long long)(int64_t)h_mask[1],
+                    (long long)(int64_t)h_mask[2],(long long)(int64_t)h_mask[3],(long long)(int64_t)h_mask[4]);
+            free(h_mask);
+        }
+
+        // For PUBLIC weights W (both parties load identical model files):
+        // Weight mask r_W = 0, so gpuKeygenMatmul receives a zero buffer as h_mask_W.
+        // This makes k.B = share(0) and output mask = r_A · W + r_Z (no r_W term).
+        // Eval then reconstructs W - 0 = W, producing correct (A + r_A) · W output.
+        u64 weight_size = (u64)b.d1 * b.d2;
+        T *h_mask_W_zero = (T *)calloc(weight_size, sizeof(T));  // zero mask for public W
+
+        // CUTLASS fails with M=1 for integer GEMMs ("Error Internal" at gpu_matmul.cu:119).
+        // Pad M=1 to M=128 (typical CUTLASS SIMT tile size).
+        // Compute on padded matrix, extract row 0.
+        if (a.d1 == 1) {
+            fprintf(stderr, "  M=1 detected, padding to M=128 for CUTLASS tile (using zero weight mask)\n"); fflush(stderr);
+            const int M_PADDED = 128;
+            const u64 padded_size_A = M_PADDED * a.d2;
+            T *d_A_padded = (T *)gpuMalloc(padded_size_A * sizeof(T));
+            // Copy row 0; zero-fill rows 1..127
+            checkCudaErrors(cudaMemcpy(d_A_padded, a.d_data, a.d2 * sizeof(T), cudaMemcpyDeviceToDevice));
+            checkCudaErrors(cudaMemset(d_A_padded + a.d2, 0, (M_PADDED - 1) * a.d2 * sizeof(T)));
+
+            // Clear any sticky CUDA errors and force device sync before CUTLASS
+            cudaGetLastError();  // consume any prior error
+            checkCudaErrors(cudaDeviceSynchronize());
+
+            MatmulParams p;
+            p.M = M_PADDED;
+            p.K = a.d2;
+            p.N = b.d2;
+            p.batchSz = 1;
+            stdInit(p, bw, 0);  // FC truncation handled by separate truncateForward node
+            { size_t fr=0, tot=0; cudaMemGetInfo(&fr,&tot);
+              fprintf(stderr, "  [mem before M=1 matmul] free=%zu MB / total=%zu MB\n",
+                      fr>>20, tot>>20); fflush(stderr); }
+            u8 *kb_mm_b = keyBuf;
+            T *d_C_padded = gpuKeygenMatmul<T>(&keyBuf, party, p, d_A_padded, h_mask_W_zero, (T *)NULL, TruncateType::None, &g, false);
+            fprintf(stderr, "  [M=1 matmul keygen] kb_range=[%zu,%zu] B\n",
+                    (size_t)(kb_mm_b - startPtr), (size_t)(keyBuf - startPtr)); fflush(stderr);
+
+            // DIAGNOSTIC: Hash d_C_padded output to check CUTLASS determinism
+            {
+                T *h_C_check = (T *)malloc(M_PADDED * b.d2 * sizeof(T));
+                checkCudaErrors(cudaMemcpy(h_C_check, d_C_padded, M_PADDED * b.d2 * sizeof(T), cudaMemcpyDeviceToHost));
+                uint32_t hash = 0x12345678;
+                for (size_t i = 0; i < M_PADDED * b.d2; i++)
+                    hash = hash * 31 + (uint32_t)(uint64_t)h_C_check[i];
+                fprintf(stderr, "  [M=1 CUTLASS output hash] dim=(%d,%zu) hash=0x%08x\n", M_PADDED, (size_t)b.d2, hash);
+                fflush(stderr);
+                free(h_C_check);
+            }
+
+            // Check for errors immediately after matmul (sticky CUDA errors propagate)
+            cudaError_t err_post_matmul = cudaDeviceSynchronize();
+            if (err_post_matmul != cudaSuccess) {
+                fprintf(stderr, "  ERROR: CUDA error after gpuKeygenMatmul: %s\n", cudaGetErrorString(err_post_matmul));
+                fflush(stderr);
+            }
+
+            // Extract row 0 from padded output (size: M_PADDED x N -> 1 x N)
+            c.d_data = (T *)gpuMalloc(b.d2 * sizeof(T));
+            checkCudaErrors(cudaMemcpy(c.d_data, d_C_padded, b.d2 * sizeof(T), cudaMemcpyDeviceToDevice));
+
+            gpuFree(d_A_padded);
+            gpuFree(d_C_padded);
+            fprintf(stderr, "  M=1 padded keygen completed, extracted row 0\n"); fflush(stderr);
+            logKeyBufHash("after M=1 SECRET×PUBLIC matmul", startPtr, keyBuf);
+        } else {
+            MatmulParams p;
+            p.M = a.d1;
+            p.K = a.d2;
+            p.N = b.d2;
+            p.batchSz = 1;
+            stdInit(p, bw, 0);  // FC truncation handled by separate truncateForward node
+            c.d_data = gpuKeygenMatmul<T>(&keyBuf, party, p, a.d_data, h_mask_W_zero, (T *)NULL, TruncateType::None, &g, false);
+            logKeyBufHash("after normal SECRET×PUBLIC matmul", startPtr, keyBuf);
+        }
+
+        free(h_mask_W_zero);  // clean up zero mask buffer
+    }
+
+    // ── ADDED: element-wise secret×secret multiply (keygen) ─────────────────
+    virtual void mul(const Tensor<T> &a, const Tensor<T> &b, Tensor<T> &out)
+    {
+        // Override in derived class (DDGOrcaKeygen)
+        throw std::runtime_error("mul() not implemented in DDGOrcaBaseKeygen");
+    }
+
+    // ── ADDED: public-scalar multiply (keygen) ──────────────────────────────
+    virtual void scalarmul(Tensor<T> &x, T scalar, Tensor<T> &y)
+    {
+        // Override in derived class (DDGOrcaKeygen)
+        throw std::runtime_error("scalarmul() not implemented in DDGOrcaBaseKeygen");
+    }
+
+    void avgPool2D(u64 ks, u64 padding, u64 stride, const Tensor4D<T> &in, Tensor4D<T> &out, u64 scale)
+    {
+        AvgPoolParams p = {
+            bw, bw, (int)scale, (int)scale, 0, (int)in.d1, (int)in.d2, (int)in.d3, (int)in.d4,
+            (int)ks, (int)ks, (int)stride, (int)stride, (int)padding, (int)padding, (int)padding, (int)padding, 0, 0, false};
+        initPoolParams(p);
+        out.d_data = gpuAddPool(p, in.d_data, (Stats *)NULL);
+    }
+
+    void add(const std::vector<Tensor<T> *> &in, Tensor<T> &out)
+    {
+        int tmpBw = this->bw - this->scale;
+        int N = in[0]->size();
+        std::vector<T *> gpuInp;
+        for (int i = 0; i < in.size(); i++)
+        {
+            gpuInp.push_back(in[i]->d_data);
+        }
+        out.d_data = gpuAdd(tmpBw, N, gpuInp);
+    }
+
+    void addbias(Tensor<T> &x, const Tensor1D<T> &bias)
+    {
+        gpuAddBias(1, x.size() / bias.d1, bias.d1, bw, x.d_data, bias.data, NULL);
+    }
+
+    void output(Tensor<T> &a)
+    {
+        int N = a.size();
+        size_t memSz = N * sizeof(T);
+        if (std::getenv("DDG_DUMP_OUTPUT")) {
+            T *h_rz = (T *)malloc(memSz);
+            checkCudaErrors(cudaMemcpy(h_rz, a.d_data, memSz, cudaMemcpyDeviceToHost));
+            fprintf(stderr, "[keygen output DUMP] party=%d N=%d\n", party, N);
+            for (int j = 0; j < 5 && j < N; j++)
+                fprintf(stderr, "  [%d] r_Z_share=%lld\n", j, (long long)(int64_t)h_rz[j]);
+            free(h_rz);
+        }
+        moveIntoCPUMem((u8 *)keyBuf, (u8 *)a.d_data, memSz, (Stats *)NULL);
+        keyBuf += memSz;
+    }
+
+    void optimize(LayerGraphNode<T> *root)
+    {
+        topologicalApply(root, [&](LayerGraphNode<T> *n, LayerGraphNode<T> *r)
+                         { ddgOrcaOpt<T>(n, r); });
+        topologicalApply(root, [&](LayerGraphNode<T> *n, LayerGraphNode<T> *r)
+                         { pinCpuMem(n, r); });
+    }
+};
