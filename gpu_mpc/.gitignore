@@ -1,2 +1,22 @@
+# Build artifacts
 deepdtagen_inference
 *.o
+*.so
+
+# Logs and debug output
+*.log
+*.err
+*.out
+
+# Generated FSS keys (regenerate with keygen; can be tens of GB)
+keys_*/
+
+# Generated/intermediate test data (keep davis_mb_0 as reference sample)
+davis_mb_[1-9]*/
+davis_mb_*_mask*/
+test_batch*/
+test_row*/
+test_sample*/
+test_dir/
+test_keys/
+shares_tmp/

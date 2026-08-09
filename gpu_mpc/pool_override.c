@@ -1,19 +1,11 @@
 /*
- * pool_override.c — LD_PRELOAD stub that replaces initGPUMemPool() from
- * /home/jiang/EzPC/GPU-MPC/utils/gpu_mem.cu.
+ * pool_override.c — Linker wraps for GPU-MPC memory functions.
  *
- * The upstream implementation does:
- *   1. Set cudaMemPoolAttrReleaseThreshold = UINT64_MAX  (keep-all)
- *   2. cudaMallocAsync(&p, 40GiB, 0) as a warmup probe
- *   3. cudaFreeAsync(p, 0)
+ * 1. initGPUMemPool: replaces the upstream 40GiB probe (OOMs on 8GiB GPU).
+ * 2. gpuMalloc: wraps cudaMallocAsync to zero-initialize GPU memory, eliminating
+ *    nondeterministic keygen from uninitialized buffer residue.
  *
- * Step 2 fails with OOM on an 8 GiB GPU (RTX 4060 Laptop).  The probe is
- * purely an eager pool-reservation; skipping it is safe — actual allocations
- * from gpuMalloc() / moveToGPU() still work on demand via the async pool.
- *
- * This stub sets the threshold (preserving the intended pool behaviour) and
- * skips the 40 GiB probe.  Link order: LD_PRELOAD this .so before the binary
- * so the dynamic linker resolves initGPUMemPool to this version.
+ * Linked via -Wl,--wrap=initGPUMemPool,--wrap=gpuMalloc in Makefile.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -26,11 +18,52 @@ void __wrap_initGPUMemPool(void)
 
     cudaDeviceGetDefaultMemPool(&mempool, device);
 
-    /* Keep pool memory: don't return it to the OS until the pool is destroyed */
-    uint64_t threshold = UINT64_MAX;
+    /* Release threshold controls how much freed pool memory is retained rather
+     * than returned to the OS. threshold=0 returns every freed block to the OS
+     * immediately — correct for avoiding fragmentation, but with the pool's ~1100
+     * malloc/free cycles per forward (137 iterations × several ops), each free is
+     * an OS release syscall and each subsequent malloc re-acquires from the OS,
+     * costing several seconds of pure syscall/sync overhead.
+     *
+     * A moderate cap (default 384 MiB, override via DDG_POOL_RETAIN_MB) keeps the
+     * small pooling working set cached in-pool (fast reuse, no OS round-trip) while
+     * still releasing large blocks. The 512 MiB comm buffer is allocated ONCE at
+     * startup (before the fold), so caching small blocks during the fold cannot
+     * starve it. Set DDG_POOL_RETAIN_MB=0 to restore the old immediate-release. */
+    uint64_t retain_mb = 384;
+    const char *env = getenv("DDG_POOL_RETAIN_MB");
+    if (env != NULL) retain_mb = (uint64_t)strtoull(env, NULL, 10);
+    uint64_t threshold = retain_mb * 1024ULL * 1024ULL;
     cudaMemPoolSetAttribute(mempool, cudaMemPoolAttrReleaseThreshold, &threshold);
 
     /* Skip the 40 GiB warm-up probe — it OOMs on 8 GiB GPUs.
      * Pool memory is committed on first actual allocation instead. */
-    printf("[pool_override] initGPUMemPool: threshold=UINT64_MAX, probe skipped (GPU<40GiB)\n");
+    printf("[pool_override] initGPUMemPool: retain=%llu MiB, probe skipped (GPU<40GiB)\n",
+           (unsigned long long)retain_mb);
+}
+
+/* __real_gpuMalloc is the original gpuMalloc from utils/gpu_mem.cu, provided
+ * by the linker's --wrap mechanism. */
+extern uint8_t *__real_gpuMalloc(size_t size_in_bytes);
+
+/*
+ * __wrap_gpuMalloc — zero-initialize every GPU allocation.
+ *
+ * WHY: gpuMalloc uses cudaMallocAsync, which returns pool memory WITHOUT
+ * zeroing. DPF keygen (doDpfTreeKeyGen in fss/gpu_dpf.cu) allocates key buffers
+ * (d_k0/d_l0/d_l1/d_tR) and writes them bit-by-bit via packed writes (writeVCW),
+ * leaving unwritten bytes as pool residue. moveIntoCPUMem then copies the whole
+ * buffer — residue included — into the key file. Since the residue differs
+ * across runs/processes, the two dealer processes (party 0, party 1) produce
+ * MISMATCHED correction words, breaking the FSS invariant that CWs must be
+ * identical across parties. Zeroing on allocation makes keygen deterministic
+ * so both dealers generate matching keys. This preserves Sigma's per-party
+ * independent-dealer design (each party still runs its own keygen process).
+ */
+uint8_t *__wrap_gpuMalloc(size_t size_in_bytes)
+{
+    uint8_t *d_a = __real_gpuMalloc(size_in_bytes);
+    if (d_a != NULL && size_in_bytes > 0)
+        cudaMemset(d_a, 0, size_in_bytes);
+    return d_a;
 }

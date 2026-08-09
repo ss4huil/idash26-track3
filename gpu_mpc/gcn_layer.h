@@ -107,6 +107,9 @@ public:
     Tensor<T> &_forward(Tensor<T> &X) override
     {
         assert(_a_hat != nullptr && "GCNLayer::_forward called without A_hat stash");
+
+        // NOTE: _MatMul's d_data copy-back is fixed via the shadow header
+        // idash/mpc/gpu_mpc/sytorch/layers/layers.h (upstream _MatMul omits it).
         auto &AX  = matmul(*_a_hat, X);  // secret x secret        -> (N, in_feat)
         auto &Z   = lin->forward(AX);    // AX @ W^T + b (P2 weights) -> (N, out)
         auto &act = relu(Z);             // ReLU (>= 0)            -> (N, out)

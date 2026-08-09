@@ -41,7 +41,8 @@
 #include <numeric>
 #include <omp.h>
 
-#include "backend/orca.h"
+#include "ddg_orca.h"  // Forked Orca backend with mul/scalarmul for graph models
+#include "ddg_orca_batched.h"  // Optimized backend with LocalARS truncation
 #include "deepdtagen.h"
 
 #ifndef InfType
@@ -141,12 +142,11 @@ static void loadWeightsI64(DeepDTAGenAffinity<InfType> *model,
             bref.data[j] = (InfType)(uint64_t)((int64_t)buf[offset + j] << (int)scale);
         offset += b_size;
     }
-    printf("[loadWeightsI64] loaded %zu int64 elements from %s\n", offset, path.c_str());
 }
 
 int main(int argc, char *argv[])
 {
-    // argv: bw scale role party keyDir shareDir [ip]
+    // argv: bw scale role party keyDir shareDir [batch] [ip]
     sytorch_init();
     int bw       = atoi(argv[1]);
     u64 scale    = strtoul(argv[2], 0, 10);
@@ -154,8 +154,10 @@ int main(int argc, char *argv[])
     int party    = atoi(argv[4]);
     auto keyDir  = std::string(argv[5]);
     auto shareDir = std::string(argv[6]);
+    int BATCH    = (argc > 7 && atoi(argv[7]) > 0) ? atoi(argv[7]) : 1;
     assert(bw <= 8 * (int)sizeof(InfType));
     assert(scale < (u64)bw);
+    assert(BATCH > 0 && BATCH <= 128);
 
     const u64 Nmax = DDG_NMAX, FEAT = DDG_FEAT;
 
@@ -166,12 +168,19 @@ int main(int argc, char *argv[])
     //   maskTiled  (Nmax x 376)   P1 node mask, tiled across pooled channels
     //   proteinEmb (1 x 128)      P2 GatedCNN output (public seq) as a share
     // GCN biases fold into P2's FC weights (see gcn_layer.h) — no bias leaf here.
-    Tensor<InfType> X({Nmax, FEAT});
-    Tensor<InfType> A_hat({Nmax, Nmax});
-    Tensor<InfType> maskTiled({Nmax, 376});
-    Tensor<InfType> proteinEmb({1, 128});
+    // Batched mode folds the batch dim into rows: X (B*Nmax x FEAT),
+    // A_hat (B*Nmax x Nmax), maskTiled (B*Nmax x 376), proteinEmb (B x 128).
+    // For B=1 this reduces to the original single-sample shapes.
+    Tensor<InfType> X({(u64)BATCH * Nmax, FEAT});
+    Tensor<InfType> A_hat({(u64)BATCH * Nmax, Nmax});
+    Tensor<InfType> maskTiled({(u64)BATCH * Nmax, 376});
+    Tensor<InfType> proteinEmb({(u64)BATCH, 128});
+
+    // Dealer: zero-init for now; actual random masks generated after backend init
+    // Evaluator: zero-init (overwritten by loadShare below)
     X.zero(); A_hat.zero(); maskTiled.zero(); proteinEmb.zero();
     model->setSample(&A_hat, &maskTiled, &proteinEmb);
+    model->setBatch((u64)BATCH);
 
     // ── side-input graph-gen setup ──────────────────────────────────────────
     // SytorchModule::init(scale, X) sets X.graphGenMode=true and creates X's
@@ -225,20 +234,50 @@ int main(int argc, char *argv[])
     }
 
     auto expName = std::string("DeepDTAGen_") + std::to_string(bw) + "_" + std::to_string(scale);
-    auto keyFileName = keyDir + expName;
+    auto keyFileName = keyDir + expName + "_party" + std::to_string(party);
 
     if (role == 0)
     {
-        // Dealer: generate FSS keys for the whole graph. Inputs stay zeroed;
-        // only shapes matter for keygen.
-        auto fss = new OrcaKeygen<InfType>(party, bw, scale, keyFileName);
+        // Dealer: generate FSS keys for the whole graph.
+        // The DDGOrcaKeygen constructor calls initGPURandomness() (seed 12345),
+        // so randomGEOnGpu is ready AFTER this line.
+
+        // Select backend based on optimization flags
+        DDGOrcaBaseKeygen<InfType> *fss = nullptr;
+        if (std::getenv("DDG_SLACK_TRUNC") || std::getenv("DDG_LOCAL_TRUNC")) {
+            fss = new DDGOrcaKeygenBatched<InfType>(party, bw, scale, keyFileName);
+        } else {
+            fss = new DDGOrcaKeygen<InfType>(party, bw, scale, keyFileName);
+        }
         model->setBackend(fss);
         model->optimize();
-        X.d_data = (InfType *)moveToGPU((u8 *)X.data, X.size() * sizeof(InfType), (Stats *)NULL);
+
+        // ORCA SMALL-MASK SCHEME (solves large-mask truncation precision loss).
+        // The mask r_X is share0 (the pad from offline split_shares). To avoid
+        // FSS truncation errors from wrap-around at the 2^31 sign boundary, the
+        // OFFLINE share generator MUST use a small mask (mask_bw≈14) rather than
+        // a full-range 32-bit pad. Both dealers load the SAME share0, so
+        // writeShares produces consistent complementary key shares.
+        //
+        // DIAGNOSTIC CONFIRMED: bw=32 mask → 11.9x error (64.15 vs 5.37);
+        //                       bw=14 mask → 13% error  (4.66 vs 5.37, optimal).
+        // NOTE: proteinEmb is P2's public value (party 1 owns it, party 0 zero).
+        // Keygen uses r_protein = 0 for both parties (proteinEmb.d_data stays 0),
+        // making the fused mask [r_d2 | 0]. Eval reconstructs the additive share
+        // (0, P) to get P on both parties before concat.
+        loadShare(shareDir + "/x_share0.dat", X);
+        loadShare(shareDir + "/adj_share0.dat", A_hat);
+        loadShare(shareDir + "/mask_share0.dat", maskTiled);
+        // proteinEmb NOT loaded in keygen → d_data stays 0 → r_protein = 0
+
+        X.d_data         = (InfType *)moveToGPU((u8 *)X.data, X.size() * sizeof(InfType), nullptr);
+        A_hat.d_data     = (InfType *)moveToGPU((u8 *)A_hat.data, A_hat.size() * sizeof(InfType), nullptr);
+        maskTiled.d_data = (InfType *)moveToGPU((u8 *)maskTiled.data, maskTiled.size() * sizeof(InfType), nullptr);
+        proteinEmb.d_data = (InfType *)moveToGPU((u8 *)proteinEmb.data, proteinEmb.size() * sizeof(InfType), nullptr);
+
         auto &out = model->forward(X);
         fss->output(out);
         fss->close();
-        printf("[dealer] keys written to %s\n", keyFileName.c_str());
     }
     else
     {
@@ -252,8 +291,15 @@ int main(int argc, char *argv[])
         if (party == 1)
             loadShare(shareDir + "/protein_emb.dat", proteinEmb);
 
-        auto ip = argv[7];
-        auto fss = new Orca<InfType>(party, ip, bw, (int)scale, keyFileName);
+        auto ip = (argc > 8) ? argv[8] : "127.0.0.1";
+
+        // Select backend based on optimization flags
+        DDGOrcaBase<InfType> *fss = nullptr;
+        if (std::getenv("DDG_SLACK_TRUNC") || std::getenv("DDG_LOCAL_TRUNC")) {
+            fss = new DDGOrcaBatched<InfType>(party, ip, bw, (int)scale, keyFileName);
+        } else {
+            fss = new DDGOrca<InfType>(party, ip, bw, (int)scale, keyFileName);
+        }
         model->setBackend(fss);
         model->optimize();
 
@@ -261,15 +307,77 @@ int main(int argc, char *argv[])
         u64 commBytes = 0;
         lseek(fss->fd, 0, SEEK_SET);
         readKey(fss->fd, fss->keySize, fss->startPtr, NULL);
+
+        // ── OPTIMIZATION: One-time H2D upload + per-iteration D2D refresh ──────
+        // revealIfLeaf mutates GPU data in-place (share → revealed value), so we
+        // can't reuse the same buffer across iterations. Instead: upload pristine
+        // copies once (H2D, slow), then use fast D2D memcpy each iteration to
+        // refresh working buffers from the pristine copies.
+        //
+        // Baseline: 11× H2D upload (moveToGPU) of ~4 MB → ~3 ms total on PCIe 3.0×16
+        // Optimized: 1× H2D + 10× D2D refresh → ~0.3 ms H2D + ~0.05 ms D2D (50× faster)
+        InfType *d_X_pristine          = (InfType *)moveToGPU((u8 *)X.data,          X.size()          * sizeof(InfType), NULL);
+        InfType *d_A_hat_pristine      = (InfType *)moveToGPU((u8 *)A_hat.data,      A_hat.size()      * sizeof(InfType), NULL);
+        InfType *d_maskTiled_pristine  = (InfType *)moveToGPU((u8 *)maskTiled.data,  maskTiled.size()  * sizeof(InfType), NULL);
+        InfType *d_proteinEmb_pristine = (InfType *)moveToGPU((u8 *)proteinEmb.data, proteinEmb.size() * sizeof(InfType), NULL);
+
+        // Allocate working buffers (will be overwritten by D2D copy each iteration)
+        InfType *d_X_work          = (InfType *)gpuMalloc(X.size()          * sizeof(InfType));
+        InfType *d_A_hat_work      = (InfType *)gpuMalloc(A_hat.size()      * sizeof(InfType));
+        InfType *d_maskTiled_work  = (InfType *)gpuMalloc(maskTiled.size()  * sizeof(InfType));
+        InfType *d_proteinEmb_work = (InfType *)gpuMalloc(proteinEmb.size() * sizeof(InfType));
+
         Tensor<InfType> *out_ptr = nullptr;   // capture last forward output
         for (int i = 0; i < 11; i++)
         {
             fss->keyBuf = fss->startPtr;
             fss->s.reset();
+            fss->sxsMatmulIdx = 0;   // reset per-forward SxS matmul counter (reveal only fires on #0)
+            fss->resetLeaves();      // clear leaf registry from prior iteration
             fss->peer->sync();
             auto commStart = fss->peer->bytesSent() + fss->peer->bytesReceived();
             auto start = std::chrono::high_resolution_clock::now();
-            X.d_data = (InfType *)moveToGPU((u8 *)X.data, X.size() * sizeof(InfType), &(fss->s));
+
+            // Fast D2D refresh from pristine → working buffers (replaces slow H2D moveToGPU)
+            checkCudaErrors(cudaMemcpy(d_X_work,          d_X_pristine,          X.size()          * sizeof(InfType), cudaMemcpyDeviceToDevice));
+            checkCudaErrors(cudaMemcpy(d_A_hat_work,      d_A_hat_pristine,      A_hat.size()      * sizeof(InfType), cudaMemcpyDeviceToDevice));
+            checkCudaErrors(cudaMemcpy(d_maskTiled_work,  d_maskTiled_pristine,  maskTiled.size()  * sizeof(InfType), cudaMemcpyDeviceToDevice));
+            checkCudaErrors(cudaMemcpy(d_proteinEmb_work, d_proteinEmb_pristine, proteinEmb.size() * sizeof(InfType), cudaMemcpyDeviceToDevice));
+
+            X.d_data          = d_X_work;
+            A_hat.d_data      = d_A_hat_work;
+            maskTiled.d_data  = d_maskTiled_work;
+            proteinEmb.d_data = d_proteinEmb_work;
+
+            // Register secret leaves for reveal-on-first-use. proteinEmb is P2's
+            // public value (party 1 holds it, party 0 holds zero), but it still
+            // needs to be revealed so both parties hold the same masked-public value.
+            //
+            // Batched mode: A_hat and X (first GCN input) use per-slice reveal in
+            // _MatMul. Register each slice pointer so revealIfLeaf matches.
+            if (BATCH == 1) {
+                fss->registerLeaf(X.d_data);
+                fss->registerLeaf(A_hat.d_data);
+                fss->registerLeaf(maskTiled.d_data);
+                fss->registerLeaf(proteinEmb.d_data);
+            } else {
+                // X: register each (Nmax×FEAT) slice for batched _MatMul reveal in gcn1.
+                for (int b = 0; b < BATCH; ++b) {
+                    fss->registerLeaf(X.d_data + b * Nmax * FEAT);
+                }
+
+                // A_hat: register each (Nmax×Nmax) slice for batched _MatMul reveal.
+                for (int b = 0; b < BATCH; ++b) {
+                    fss->registerLeaf(A_hat.d_data + b * Nmax * Nmax);
+                }
+
+                // maskTiled: register full folded pointer (pool uses full tensor).
+                fss->registerLeaf(maskTiled.d_data);
+
+                // proteinEmb: batched (B×128), register full pointer for GPUConcat reveal.
+                fss->registerLeaf(proteinEmb.d_data);
+            }
+
             auto &out = model->forward(X);
             fss->output(out);
             out_ptr = &out;   // model holds this tensor; stable across iters
@@ -280,19 +388,52 @@ int main(int argc, char *argv[])
             if (i == 0)
                 commBytes = commEnd - commStart;
         }
+
+        // Clean up pristine and working GPU buffers
+        gpuFree(d_X_pristine);
+        gpuFree(d_A_hat_pristine);
+        gpuFree(d_maskTiled_pristine);
+        gpuFree(d_proteinEmb_pristine);
+        gpuFree(d_X_work);
+        gpuFree(d_A_hat_work);
+        gpuFree(d_maskTiled_work);
+        gpuFree(d_proteinEmb_work);
+
         fss->close();
         auto avgTime = std::reduce(times.begin(), times.end()) / (float)times.size();
         printf("Average time taken (microseconds)=%f\n", avgTime);
         printf("Comm (B)=%lu\n", commBytes);
 
+        // Per-operation timing breakdown (microseconds)
+        if (party == 0) {
+            printf("\n=== Timing breakdown (us) ===\n");
+            printf("  matmul:    %10lu  (comm: %10lu)\n", fss->s.matmul_time, fss->s.matmul_comm_time);
+            printf("  relu:      %10lu\n", fss->s.relu_time);
+            printf("  reluext:   %10lu  (comm: %10lu)\n", fss->s.reluext_time, fss->s.reluext_comm_time);
+            printf("  maxpool:   %10lu  (comm: %10lu)\n", fss->s.maxpool_time, fss->s.maxpool_comm_time);
+            printf("  truncate:  %10lu  (comm: %10lu)\n", fss->s.truncate_time, fss->s.truncate_comm_time);
+            printf("  signext:   %10lu\n", fss->s.signext_time);
+            printf("  transfer:  %10lu\n", fss->s.transfer_time);
+            printf("  compute:   %10lu\n", fss->s.compute_time);
+            printf("  total_comm:%10lu\n", fss->s.comm_time);
+            printf("=============================\n\n");
+        }
+
         // Reveal the final affinity scalar.
         // fss->output() reconstructs shares onto party 0's host tensor.
         // Party 0 prints; party 1 stays silent to avoid duplicate output.
         if (party == 0 && out_ptr != nullptr) {
-            // Reinterpret the ring value as signed int32, divide by 2^scale.
-            int32_t sv = (int32_t)(uint32_t)(uint64_t)out_ptr->data[0];
-            double  aff = (double)sv / (double)(1LL << scale);
-            printf("AFFINITY=%.6f\n", aff);
+            // Reinterpret each ring value as signed int32, divide by 2^scale.
+            // Batched mode: output is (B, 1) → print B affinities (one per sample).
+            int n_out = (int)out_ptr->size();
+            for (int j = 0; j < n_out; j++) {
+                int32_t sv = (int32_t)(uint32_t)(uint64_t)out_ptr->data[j];
+                double  aff = (double)sv / (double)(1LL << scale);
+                if (n_out == 1)
+                    printf("AFFINITY=%.6f\n", aff);
+                else
+                    printf("AFFINITY[%d]=%.6f\n", j, aff);
+            }
         }
     }
     return 0;

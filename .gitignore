@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.pyc
+
+# Build artifacts
+gpu_mpc/deepdtagen_inference
+*.o
+*.so
+*.a
+
+# Large model files (download separately)
+model/*.pth
+model/*.pt
+*.pkl
+
+# Logs and debug output
+*.log
+*.err
+*.out
+
+# Generated FSS keys (can be tens of GB)
+keys_*/
+*_keys/
+keys/
+
+# Test results and temporary data
+*_test_results.json
+*_benchmark_results.json
+prepare_out.txt
+
+# Generated/intermediate test data
+gpu_mpc/davis_mb_*/
+gpu_mpc/test_batch*/
+gpu_mpc/test_row*/
+gpu_mpc/test_sample*/
+gpu_mpc/test_dir/
+gpu_mpc/shares_tmp/
+
+# Generated MPC artifacts (weights + secret shares)
+gpu_mpc/weights.bin
+gpu_mpc/weights.bin.json
+gpu_mpc/**/*.dat
+gpu_mpc/**/batch_manifest.json
+gpu_mpc/**/golden_affinities.json
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

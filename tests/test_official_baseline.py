@@ -17,9 +17,10 @@ import math
 import pytest
 
 from baseline import official_baseline_data as ob
+from test_data_paths import DAVIS_TEST_CSV, KIBA_TRAIN_CSV
 
-DAVIS_CSV = "/home/jiang/master/idash/project/test/davis_test.csv"
-KIBA_CSV = "/home/jiang/master/idash/project/test/kiba_test.csv"
+DAVIS_CSV = DAVIS_TEST_CSV
+KIBA_CSV = KIBA_TRAIN_CSV
 
 # Vocab sizes frozen into the released checkpoints.
 EXPECTED_VOCAB = {"davis": 58, "kiba": 69}

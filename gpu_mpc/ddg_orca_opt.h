@@ -137,8 +137,20 @@ void ddgOrcaOpt(LayerGraphNode<T> *node, LayerGraphNode<T> *root)
         // Structural reshape: pass through parent mode (no computation).
         node->layer->mode = node->parents[0]->layer->mode;
     }
+    // ── ADDED: fused masked max-pool (Path B+A) ─────────────────────────────
+    else if (node->layer->name == "MaskedMaxPoolLayer")
+    {
+        // Fused tree-reduction pool. Internally runs scalarmul→truncate→add→
+        // relu→add per tree level, replicating the functional fold's crypto
+        // sequence exactly. Its OUTPUT is the sum of an even-plane share and a
+        // relu-share (both scale-12, full 32-bit under Sigma), i.e. mode 0 —
+        // same as the functional fold's terminal Add node. Advertise mode 0 so
+        // the downstream FC (dfc1) sees the identical mode it saw before and
+        // does NOT sign-extend. Parent (_Mul mask-multiply) is already mode 0.
+        node->layer->mode = 0;
+    }
     // ─────────────────────────────────────────────────────────────────────────
-    else if (node->layer->name == "Add" || node->layer->name == "Concat")
+    else if (node->layer->name == "Add" || node->layer->name == "Concat" || node->layer->name == "_Sub")
     {
         int m = 0;
         for (auto &parent : node->parents)

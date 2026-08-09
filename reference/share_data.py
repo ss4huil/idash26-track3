@@ -54,11 +54,16 @@ def _to_ring(x_float: np.ndarray, scale: int, bw: int) -> np.ndarray:
 
 
 def split_shares(x_float, scale: int = DEFAULT_SCALE, seed: int = 0,
-                 bw: int = DEFAULT_BW):
+                 bw: int = DEFAULT_BW, mask_bw: int = None):
     """Split a float array into two additive shares over Z_{2^bw}.
 
     Returns (share1, share2) flat unsigned arrays (uint32 for bw=32, uint64
     for bw=64) such that share1 + share2 ≡ round(x*2^scale) (mod 2^bw).
+
+    Args:
+        mask_bw: If provided, generate pad in [0, 2^mask_bw) instead of [0, 2^bw).
+                 Use mask_bw=14 for Orca small-mask scheme to avoid FSS truncation
+                 precision loss from large masks wrapping around sign boundary.
     """
     _, _, modulus = _bw_dtype(bw)
     udtype = _bw_dtype(bw)[0]
@@ -66,7 +71,9 @@ def split_shares(x_float, scale: int = DEFAULT_SCALE, seed: int = 0,
     fixed = _to_ring(x, scale, bw)
 
     rng = np.random.default_rng(seed)
-    pad = rng.integers(0, modulus, size=fixed.shape, dtype=udtype)
+    # ORCA SMALL-MASK: limit pad to mask_bw bits to avoid truncation errors
+    pad_modulus = (1 << mask_bw) if mask_bw else modulus
+    pad = rng.integers(0, pad_modulus, size=fixed.shape, dtype=udtype)
     share1 = pad
     share2 = (fixed - pad).astype(udtype)   # wraps mod 2^bw
     return share1, share2

@@ -25,7 +25,8 @@ GPU_DIR  = os.path.join(MPC_DIR, "gpu_mpc")
 BINARY   = os.path.join(GPU_DIR, "deepdtagen_inference")
 RUN_SH   = os.path.join(GPU_DIR, "run_local_2pc.sh")
 
-DAVIS_CSV = "/home/jiang/master/idash/project/test/davis_test.csv"
+from test_data_paths import DAVIS_TEST_CSV
+DAVIS_CSV = DAVIS_TEST_CSV
 BASELINE_JSON = os.path.join(MPC_DIR, "baseline", "official_baseline_davis.json")
 
 # ── fixtures / marks ────────────────────────────────────────────────────────

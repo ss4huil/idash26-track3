@@ -34,6 +34,9 @@
 
 #include <sytorch/module.h>
 #include "utils/gpu_data_types.h"
+#include <chrono>
+#include <cstdlib>
+#include <cstdio>
 
 template <typename T>
 struct MaskedGlobalMaxPool
@@ -45,11 +48,14 @@ struct MaskedGlobalMaxPool
     MaskedGlobalMaxPool(SytorchModule<T> *owner_, u64 Nmax_, u64 F_)
         : owner(owner_), Nmax(Nmax_), F(F_) {}
 
-    // b - a  via  b + (-1)*a
+    // b - a  via pure ring subtraction (no truncation, no MPC protocol).
+    // owner->sub() routes through the _Sub functional layer (doTruncationForward
+    // = false), so no Sigma DPF TrFloor truncate protocol runs — just a local
+    // gpuLinearComb [1, -1]. Replaces the old scalarmul(-1/2^scale)+add, which
+    // created a _ScalarMul node that truncated needlessly.
     Tensor<T> &sub(Tensor<T> &b, Tensor<T> &a)
     {
-        auto &nega = owner->scalarmul(a, -1.0);
-        return owner->add(b, nega);
+        return owner->sub(b, a);
     }
 
     // max(a, b) = a + ReLU(b - a), elementwise over the (F,) vectors.
@@ -75,5 +81,57 @@ struct MaskedGlobalMaxPool
             acc = &pairwise_max(*acc, row);            // (F,)
         }
         return owner->unsqueeze(*acc);   // (F,) -> (1 x F) for downstream FC
+    }
+
+    // Gather all B samples' row `i` into one (B, F) tensor.
+    //   masked is (B*Nmax, F) sample-major: sample b's row i is at index b*Nmax+i.
+    //   view() extracts that (F,) row (memcpy only — no crypto, no comm).
+    //   concat() along the last axis stacks B rows → (1, B*F), reshaped to (B, F).
+    // The gather is cheap (memcpy); the expensive crypto/comm runs later, ONCE, on
+    // the assembled (B, F).
+    Tensor<T> &gatherRow(Tensor<T> &masked, u64 i, u64 B)
+    {
+        std::vector<Tensor<T>*> rows;
+        rows.reserve(B);
+        for (u64 b = 0; b < B; ++b)
+            rows.push_back(&owner->view(masked, (i64)(b * Nmax + i)));  // (F,)
+        auto &row = owner->concat(rows);   // (1, B*F)  (host+GPU concat)
+        row.shape = {B, F};                // reinterpret as (B, F)
+        return row;
+    }
+
+    // Batched forward with TRUE amortization: H, maskTiled are (B*Nmax, F).
+    // Instead of B independent 137-deep folds (16×137 crypto ops, no amortization),
+    // run ONE 137-deep fold over (B, F) accumulators. Each of the 137 pairwise-max
+    // steps launches its truncate/relu/comm ONCE for all B samples — the fixed
+    // per-op costs (kernel launch, comm round-trip, key read) are paid 137× total
+    // rather than 16×137×. Element count (and thus key SIZE) is unchanged.
+    // Output: (B, F).
+    Tensor<T> &forward_batched(Tensor<T> &H, Tensor<T> &maskTiled, u64 B)
+    {
+        auto &masked = owner->mul(H, maskTiled);   // (B*Nmax, F), padding rows -> 0
+
+        const bool prof = (getenv("DDG_POOL_PROF") != nullptr);
+        double t_gather = 0, t_crypto = 0;
+        auto now = []() {
+            cudaDeviceSynchronize();
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+
+        // acc = row 0 across all B samples → (B, F)
+        Tensor<T> *acc = &gatherRow(masked, 0, B);
+        for (u64 i = 1; i < Nmax; ++i) {
+            double t0 = prof ? now() : 0;
+            auto &row = gatherRow(masked, i, B);       // (B, F), cheap memcpy gather
+            double t1 = prof ? now() : 0;
+            acc = &pairwise_max(*acc, row);            // ONE crypto op over B*F elems
+            double t2 = prof ? now() : 0;
+            if (prof) { t_gather += (t1 - t0); t_crypto += (t2 - t1); }
+        }
+        if (prof)
+            printf("[POOL_PROF] gather=%.3fs crypto=%.3fs (Nmax=%lu B=%lu)\n",
+                   t_gather, t_crypto, (unsigned long)Nmax, (unsigned long)B);
+        return *acc;   // (B, F)
     }
 };

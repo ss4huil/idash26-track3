@@ -64,20 +64,21 @@ FLAGS := -O3 $(GENCODE) -std=c++17 -m64 \
          -DInfType=$(if $(filter 32,$(BW)),u32,u64) \
          -DBW=$(BW) \
          -Xcompiler="-O3,-w,-std=c++17,-fpermissive,-fpic,-pthread,-fopenmp,-march=native" \
-         -Xlinker=--wrap=initGPUMemPool
+         -Xlinker=--wrap=initGPUMemPool,--wrap=gpuMalloc
 LIBS  := -lsytorch -lcryptoTools -lLLAMA -lbitpack -lcuda -lcudart -lcurand
 
 # ── include / link paths ──────────────────────────────────────────────────────
 UTIL_FILES   := $(GPU_MPC_ROOT)/utils/gpu_mem.cu \
                 $(GPU_MPC_ROOT)/utils/gpu_file_utils.cpp \
-                $(GPU_MPC_ROOT)/utils/sigma_comms.cpp
-OBJ_INCLUDES := -I '$(CUTLASS_PATH)/include' \
+                $(HERE)/utils/sigma_comms.cpp
+OBJ_INCLUDES := -I '$(HERE)' \
+                -I '$(GPU_MPC_ROOT)' \
+                -I '$(GPU_MPC_ROOT)/utils' \
+                -I '$(CUTLASS_PATH)/include' \
                 -I '$(CUTLASS_PATH)/tools/util/include' \
                 -I '$(SYTORCH_PATH)/include' \
                 -I '$(LLAMA_PATH)/include' \
-                -I '$(SYTORCH_PATH)/ext/cryptoTools' \
-                -I '$(GPU_MPC_ROOT)' \
-                -I '$(HERE)'
+                -I '$(SYTORCH_PATH)/ext/cryptoTools'
 INCLUDES     := $(OBJ_INCLUDES) \
                 -L$(CUTLASS_PATH)/build/tools/library \
                 -L$(SYTORCH_BUILD_PATH) \
@@ -94,7 +95,7 @@ pool_override.o: pool_override.c
 	gcc -O2 -fPIC -I/usr/local/cuda-$(CUDA_VERSION)/include \
 	    -c $(HERE)/pool_override.c -o $(HERE)/pool_override.o
 
-deepdtagen_inference: deepdtagen_inference.cu deepdtagen.h gcn_layer.h masked_maxpool.h pool_override.o
+deepdtagen_inference: deepdtagen_inference.cu deepdtagen.h gcn_layer.h masked_maxpool.h ddg_orca.h ddg_orca_base.h ddg_orca_opt.h pool_override.o
 	$(CXX) $(FLAGS) $(INCLUDES) $(HERE)/deepdtagen_inference.cu $(UTIL_FILES) \
 	    $(HERE)/pool_override.o $(LIBS) \
 	    -o $(HERE)/deepdtagen_inference

@@ -36,8 +36,69 @@
 #include "nn/orca/fc_layer.h"
 #include "nn/orca/relu_layer.h"
 
+#include "ddg_orca_base.h"   // DDGOrcaBase<T> for revealPublicLeaf in GPUConcat
 #include "gcn_layer.h"
 #include "masked_maxpool.h"
+#include "masked_maxpool_layer.h"   // fused tree-reduction pool (Path B+A)
+
+// GPU-aware Concat layer: concatenates d_data (GPU) in addition to host data
+template <typename T>
+class GPUConcat : public Concat<T>
+{
+public:
+    GPUConcat() : Concat<T>() { this->name = "Concat"; }  // keep "Concat" so optimizer recognizes it
+
+    void _forward(std::vector<Tensor<T> *> &arr) override
+    {
+        // Parent fills host .data
+        Concat<T>::_forward(arr);
+
+        // Reveal any public leaves (e.g. proteinEmb) before concatenation.
+        // proteinEmb is an additive share (party0=0, party1=P) with r=0 in keygen.
+        // Reconstruct to get P on both parties before concat, so the fused tensor
+        // is fully masked-public: [d2+r_d2 | P+0].
+        auto *backend = dynamic_cast<DDGOrcaBase<T>*>(this->backend);
+        if (backend) {
+            for (auto &t : arr) {
+                if (t->d_data) {
+                    backend->revealPublicLeaf(t->d_data, backend->bw, t->size());
+                }
+            }
+        }
+
+        // Populate GPU .d_data by concatenating input GPU buffers.
+        // Concat is along the LAST axis, so for B>1 rows the layout must be
+        // per-row interleaved: out[b] = [t0[b] | t1[b] | ...]. A flat contiguous
+        // copy ([all t0 | all t1]) is only correct when B==1; for B>1 it scrambles
+        // samples (each fused row would mix two different samples' halves).
+        size_t total_size = this->activation.size();
+
+        // Allocate GPU buffer only if not already allocated (activation persists across calls)
+        if (!this->activation.d_data) {
+            this->activation.d_data = (T*)gpuMalloc(total_size * sizeof(T));
+        }
+
+        // Number of rows B = outer dim of the (B, sum_of_widths) output.
+        u64 outW = this->activation.shape.back();
+        u64 B = (outW > 0) ? (total_size / outW) : 1;
+
+        // Per-row interleaved copy: for each row b, copy each input's row b slice
+        // into the fused row at the running column offset.
+        for (u64 b = 0; b < B; ++b) {
+            size_t colOff = 0;
+            for (auto &t : arr) {
+                u64 w = t->shape.back();          // this input's width (cols)
+                if (t->d_data) {
+                    checkCudaErrors(cudaMemcpy(
+                        this->activation.d_data + b * outW + colOff,
+                        t->d_data + b * w,
+                        w * sizeof(T), cudaMemcpyDeviceToDevice));
+                }
+                colOff += w;
+            }
+        }
+    }
+};
 
 #ifndef DDG_NMAX
 #define DDG_NMAX 138
@@ -70,6 +131,7 @@ public:
 
     u64 Nmax  = DDG_NMAX;
     u64 feat  = DDG_FEAT;
+    u64 BATCH = 1;   // set via setBatch() before forward
 
     // Secret side-inputs, set per-sample before forward (see setSample()).
     //  * A_hat, maskTiled : P1's drug-graph secrets.
@@ -77,9 +139,18 @@ public:
     // GCN biases fold into P2's private FC weights (associativity rewrite in
     // gcn_layer.h), so no tiled bias leaf is needed. maskTiled carries {0,1} at
     // the model fixed-point scale (share_data.py).
-    Tensor<T> *A_hat       = nullptr;   // (Nmax x Nmax)
-    Tensor<T> *maskTiled   = nullptr;   // (Nmax x 376)
-    Tensor<T> *proteinEmb  = nullptr;   // (1 x 128)
+    // Batched mode: A_hat (B*Nmax x Nmax), maskTiled (B*Nmax x 376), proteinEmb (B x 128).
+    Tensor<T> *A_hat       = nullptr;   // single: (Nmax x Nmax), batched: (B*Nmax x Nmax)
+    Tensor<T> *maskTiled   = nullptr;   // single: (Nmax x 376), batched: (B*Nmax x 376)
+    Tensor<T> *proteinEmb  = nullptr;   // single: (1 x 128), batched: (B x 128)
+
+    GPUConcat<T> *gpu_concat = nullptr;  // GPU-aware concat for fusion
+
+    // Fused masked max-pool (Path B+A): one graph node running the whole
+    // tree-reduction fold internally via batched backend crypto calls, replacing
+    // the ~1233-node functional fold. Lazily constructed in _forward once BATCH
+    // is known. Only used when BATCH > 1.
+    MaskedMaxPoolLayer<T> *mmpool = nullptr;
 
     DeepDTAGenAffinity()
     {
@@ -89,6 +160,8 @@ public:
 
         dfc1 = new FC<T>(376, 1024, true);  drelu1 = new ReLU<T>();
         dfc2 = new FC<T>(1024, 128, true);
+
+        gpu_concat = new GPUConcat<T>();
 
         ffc1 = new FC<T>(256, 1024, true);  frelu1 = new ReLU<T>();
         ffc2 = new FC<T>(1024, 512, true);  frelu2 = new ReLU<T>();
@@ -103,6 +176,8 @@ public:
         proteinEmb = proteinEmb_;
     }
 
+    void setBatch(u64 B) { BATCH = B; }
+
     // input = X, the (Nmax x FEAT) padded node-feature matrix (P1's secret).
     // Side-inputs must have been set via setSample().
     Tensor<T> &_forward(Tensor<T> &X)
@@ -114,7 +189,21 @@ public:
 
         // ---- masked global max-pool over nodes ----
         MaskedGlobalMaxPool<T> pool(this, Nmax, 376);
-        auto &pooled = pool.forward(h3, *maskTiled);   // (1 x 376)
+
+        Tensor<T> *pooledPtr;
+        if (BATCH > 1) {
+            // Path B+A: mask-multiply stays a functional _Mul node (unchanged
+            // leaf-reveal semantics), then ONE fused layer runs the entire
+            // tree-reduction fold internally — replacing the ~1233-node fold.
+            auto &masked = this->mul(h3, *maskTiled);        // (B*Nmax x 376)
+            if (mmpool == nullptr)
+                mmpool = new MaskedMaxPoolLayer<T>(BATCH, Nmax, 376);
+            mmpool->B = BATCH;                               // refresh if changed
+            pooledPtr = &mmpool->forward(masked);            // (B x 376)
+        } else {
+            pooledPtr = &pool.forward(h3, *maskTiled);       // (1 x 376)
+        }
+        auto &pooled = *pooledPtr;
 
         // ---- drug embedding ----
         auto &d1  = dfc1->forward(pooled);       // (1 x 1024)
@@ -122,9 +211,11 @@ public:
         auto &d2  = dfc2->forward(d1r);          // (1 x 128) drug embedding
 
         // ---- fusion ----
-        auto &fused = concat(d2, *proteinEmb);   // (1 x 256)
-        auto &f1 = frelu1->forward(ffc1->forward(fused));   // (1 x 1024)
-        auto &f2 = frelu2->forward(ffc2->forward(f1));      // (1 x 512)
+        auto &fused = gpu_concat->forward(d2, *proteinEmb);   // (1 x 256) GPU-aware concat
+        auto &e1 = ffc1->forward(fused);
+        auto &f1 = frelu1->forward(e1);   // (1 x 1024)
+        auto &e2 = ffc2->forward(f1);
+        auto &f2 = frelu2->forward(e2);      // (1 x 512)
         auto &f3 = frelu3->forward(ffc3->forward(f2));      // (1 x 256)
         auto &out = fout->forward(f3);                      // (1 x 1) affinity
         return out;
