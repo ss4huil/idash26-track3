@@ -110,8 +110,77 @@ public:
         }
         return v;
     }
+
+    // 随机只读访问（const、线程安全，供并行原语使用）：读 bitpos 起的 n 位
+    // （n ≤ 64），LSB-first。小端平台假定（x86/EPYC）。
+    // 记录定长 ⇒ 第 e 条记录的偏移 = base + e×record_bits，可并行定位。
+    uint64_t get_at(uint64_t bitpos, unsigned n) const {
+        if (bitpos + n > nbits)
+            throw std::runtime_error("lss::BitReader: get_at 越界（key 文件耗尽或图序错位）");
+        uint64_t byte = bitpos >> 3;
+        unsigned off = (unsigned)(bitpos & 7);
+        unsigned __int128 v = 0;
+        uint64_t total_bytes = (nbits + 7) / 8;
+        uint64_t avail = total_bytes - byte;
+        size_t take = avail < 16 ? (size_t)avail : 16;
+        memcpy(&v, buf + byte, take);   // 末尾不足 16B 时高位为零，不影响结果
+        v >>= off;
+        if (n == 64) return (uint64_t)v;
+        return (uint64_t)v & ((1ULL << n) - 1);
+    }
     bool exhausted() const { return pos >= nbits; }
 };
+
+// ── 并行安全的小位宽打包/解包（bpe ∈ {1,2,4}：每 8/bpe 个元素恰好 1 字节，
+// 各线程写整字节、互不重叠）──────────────────────────────────────────
+// out 需预先分配 (n*bpe+7)/8 字节。LSB-first，与 BitWriter 布局一致。
+inline void pack_small(uint8_t *out, const uint8_t *vals, size_t n,
+                       unsigned bpe) {
+    const unsigned per_byte = 8 / bpe;
+    const uint8_t mask = (uint8_t)((1u << bpe) - 1);
+    size_t nbytes = (n * bpe + 7) / 8;
+#ifdef _OPENMP
+#pragma omp parallel for if(nbytes > 4096)
+#endif
+    for (size_t by = 0; by < nbytes; by++) {
+        uint8_t byte = 0;
+        size_t base = by * per_byte;
+        for (unsigned k = 0; k < per_byte && base + k < n; k++)
+            byte |= (vals[base + k] & mask) << (k * bpe);
+        out[by] = byte;
+    }
+}
+
+inline void unpack_small(const uint8_t *in, uint8_t *vals, size_t n,
+                         unsigned bpe) {
+    const unsigned per_byte = 8 / bpe;
+    const uint8_t mask = (uint8_t)((1u << bpe) - 1);
+    size_t nbytes = (n * bpe + 7) / 8;
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 32768)
+#endif
+    for (size_t by = 0; by < nbytes; by++) {
+        uint8_t byte = in[by];
+        size_t base = by * per_byte;
+        for (unsigned k = 0; k < per_byte && base + k < n; k++)
+            vals[base + k] = (byte >> (k * bpe)) & mask;
+    }
+}
+
+// 并行校验 n 条定长记录的类型标签（图序错位的第一时间暴露）；
+// 供各在线原语在 get_at 随机读之前调用。
+inline void check_record_tags(const BitReader &reader, uint64_t base,
+                              unsigned rec_bits, RecordType want, size_t n) {
+    bool ok = true;
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192) reduction(& : ok)
+#endif
+    for (size_t i = 0; i < n; i++)
+        ok &= (reader.get_at(base + i * rec_bits, 3) == (uint8_t)want);
+    if (!ok)
+        throw std::runtime_error(std::string("lss: key 图序错位，期望 ") +
+                                 record_type_name(want));
+}
 
 // ── header / trailer ────────────────────────────────────────────────
 struct LssHeader {

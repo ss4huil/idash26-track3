@@ -62,6 +62,7 @@ inline int lss_port() {
 }
 // eval 侧 LSS 通道统计（atexit 打印；GpuPeer 的 Comm(B) 不含 LSS 通道）
 inline lss::Channel *g_eval_chan = nullptr;
+inline lss::LssParty *g_eval_lss = nullptr;
 inline int g_eval_party = -1;
 inline void print_eval_stats_trampoline() {
     if (g_eval_chan)
@@ -69,6 +70,12 @@ inline void print_eval_stats_trampoline() {
                 "[lss-eval] party%d: LSS channel total sent=%llu B recv=%llu B\n",
                 g_eval_party, (unsigned long long)g_eval_chan->bytes_sent,
                 (unsigned long long)g_eval_chan->bytes_recv);
+    if (g_eval_lss)
+        fprintf(stderr,
+                "[lss-eval] party%d: LSS 分阶段耗时(ms) leaf=%.1f tree=%.1f "
+                "mux=%.1f bridge=%.1f\n",
+                g_eval_party, g_eval_lss->us_leaf / 1e3, g_eval_lss->us_tree / 1e3,
+                g_eval_lss->us_mux / 1e3, g_eval_lss->us_bridge / 1e3);
 }
 } // namespace ddg_lss_detail
 
@@ -108,6 +115,7 @@ private:
             std::atexit(ddg_lss_detail::print_eval_stats_trampoline);
         }
         ddg_lss_detail::g_eval_chan = lss_chan_;
+        ddg_lss_detail::g_eval_lss = lss_;
         ddg_lss_detail::g_eval_party = this->party;
         fprintf(stderr, "[lss-eval] party%d: LSS channel up, key=%s\n",
                 this->party, lss_key_path.c_str());

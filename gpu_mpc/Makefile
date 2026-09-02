@@ -97,14 +97,15 @@ pool_override.o: pool_override.c
 
 # LSS objects (v2 P3): plain g++ -O2, no CUDA. Linked into the main binary
 # only when DDG_LSS_RELU is used at runtime (headers are always included).
+# -fopenmp: 元素级并行（v2 性能项）；nvcc 链接端补 -lgomp（见下）。
 LSS_OBJS := $(HERE)/lss/lss_keygen.o $(HERE)/lss/lss_online.o $(HERE)/lss/lss_compare.o
 
 $(HERE)/lss/%.o: $(HERE)/lss/%.cpp
-	g++ -O2 -std=c++17 -Wall -Wextra -I$(HERE)/lss -c $< -o $@
+	g++ -O2 -std=c++17 -Wall -Wextra -fopenmp -I$(HERE)/lss -c $< -o $@
 
 deepdtagen_inference: deepdtagen_inference.cu deepdtagen.h gcn_layer.h masked_maxpool.h secure_adj_norm.h ddg_orca.h ddg_orca_base.h ddg_orca_opt.h pool_override.o $(LSS_OBJS)
 	$(CXX) $(FLAGS) $(INCLUDES) $(HERE)/deepdtagen_inference.cu $(UTIL_FILES) \
-	    $(HERE)/pool_override.o $(LSS_OBJS) $(LIBS) \
+	    $(HERE)/pool_override.o $(LSS_OBJS) $(LIBS) -lgomp \
 	    -o $(HERE)/deepdtagen_inference
 
 clean:
@@ -118,7 +119,7 @@ lss_test: $(LSS_DIR)/lss_test.cpp $(LSS_DIR)/lss_keygen.cpp $(LSS_DIR)/lss_onlin
           $(LSS_DIR)/lss_compare.cpp \
           $(LSS_DIR)/lss_keys.h $(LSS_DIR)/lss_keygen.h $(LSS_DIR)/lss_online.h \
           $(LSS_DIR)/lss_channel.h
-	g++ -O2 -std=c++17 -Wall -Wextra -I$(LSS_DIR) \
+	g++ -O2 -std=c++17 -Wall -Wextra -fopenmp -I$(LSS_DIR) \
 	    $(LSS_DIR)/lss_test.cpp $(LSS_DIR)/lss_keygen.cpp $(LSS_DIR)/lss_online.cpp \
 	    $(LSS_DIR)/lss_compare.cpp \
 	    -o $(LSS_DIR)/lss_test
