@@ -17,26 +17,32 @@ namespace lss {
 // ── 原语 1：AND ─────────────────────────────────────────────────────
 // e = open(x ⊕ a), f = open(y ⊕ b)
 // z_i = c_i ⊕ (f∧a_i) ⊕ (e∧b_i) ⊕ (e∧f∧[i==0])
+// LSS2：a_i,b_i 双方 PRF 再生；c₁ 由 P1 流再生，c₀ 显式存 P0（1 bit）。
 void LssParty::and_open(const uint8_t *x, const uint8_t *y, uint8_t *z,
                         size_t n) {
-    // BIT_TRIPLE 记录：3(tag)+3 = 6 bit/条
+    // BIT_TRIPLE 记录：P0 = 3(tag)+1(c0) = 4 bit/条；P1 = 3 bit/条
+    const unsigned rec_bits = (party == 0) ? 4 : 3;
     const uint64_t base = keys.reader.pos;
-    check_record_tags(keys.reader, base, 6, REC_BIT_TRIPLE, n);
+    const uint64_t idx0 = keys.stream_pos(REC_BIT_TRIPLE);
+    check_record_tags(keys.reader, base, rec_bits, REC_BIT_TRIPLE, n);
 
     std::vector<uint8_t> ef(2 * n), abc(n);
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 8192)
 #endif
     for (size_t i = 0; i < n; i++) {
-        uint64_t rec = base + 3 + i * 6;
-        uint8_t a = (uint8_t)keys.reader.get_at(rec, 1);
-        uint8_t b = (uint8_t)keys.reader.get_at(rec + 1, 1);
-        uint8_t c = (uint8_t)keys.reader.get_at(rec + 2, 1);
+        uint64_t w = keys.prf(REC_BIT_TRIPLE, idx0 + i, 0);
+        uint8_t a = (uint8_t)(w & 1);
+        uint8_t b = (uint8_t)((w >> 1) & 1);
+        uint8_t c = (party == 0)
+                        ? (uint8_t)keys.reader.get_at(base + 3 + i * 4, 1)
+                        : (uint8_t)((w >> 2) & 1);
         ef[2 * i] = x[i] ^ a;
         ef[2 * i + 1] = y[i] ^ b;
         abc[i] = (a << 2) | (b << 1) | c;
     }
-    keys.reader.pos = base + 6 * n;
+    keys.reader.pos = base + (uint64_t)rec_bits * n;
+    keys.stream_advance(REC_BIT_TRIPLE, n);
 
     std::vector<uint8_t> snd((2 * n + 7) / 8), rcv(snd.size());
     pack_small(snd.data(), ef.data(), 2 * n, 1);
@@ -68,17 +74,17 @@ void LssParty::ot16_send(const uint8_t *g, const uint8_t *s, size_t n) {
     std::vector<uint8_t> deltas(n);
     unpack_small(dbuf.data(), deltas.data(), n, 4);
 
-    // OT16_SEND 记录：3(tag)+32 = 35 bit/条；回复 16×2 bit = 4 B/元素
+    // OT16_SEND 记录（LSS2）：tag only，3 bit/条；16 个 pad 由本方流再生。
+    // 回复 16×2 bit = 4 B/元素
     const uint64_t base = keys.reader.pos;
-    check_record_tags(keys.reader, base, 35, REC_OT16_SEND, n);
+    const uint64_t idx0 = keys.stream_pos(REC_OT16_SEND);
+    check_record_tags(keys.reader, base, 3, REC_OT16_SEND, n);
     std::vector<uint8_t> reply(n * 4);
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 4096)
 #endif
     for (size_t e = 0; e < n; e++) {
-        uint64_t rec = base + 3 + e * 35;
-        // 16 个 pad 一次读出（32 bit），比 16 次 get_at 省 ~8 倍开销
-        uint32_t pads = (uint32_t)keys.reader.get_at(rec, 32);
+        uint32_t pads = (uint32_t)keys.prf(REC_OT16_SEND, idx0 + e, 0);
         uint8_t sv = s[e] & 3;
         uint8_t delta = deltas[e];
         uint8_t c[16];
@@ -91,25 +97,27 @@ void LssParty::ot16_send(const uint8_t *g, const uint8_t *s, size_t n) {
         reply[e * 4 + 2] = c[8] | (c[9] << 2) | (c[10] << 4) | (c[11] << 6);
         reply[e * 4 + 3] = c[12] | (c[13] << 2) | (c[14] << 4) | (c[15] << 6);
     }
-    keys.reader.pos = base + 35 * n;
+    keys.reader.pos = base + 3 * n;
+    keys.stream_advance(REC_OT16_SEND, n);
     chan.send_all(reply.data(), reply.size());
 }
 
 void LssParty::ot16_recv(const uint8_t *d, uint8_t *out, size_t n) {
-    // OT16_RECV 记录：3(tag)+6 = 9 bit/条
+    // OT16_RECV 记录（LSS2）：3(tag)+2(k_r) = 5 bit/条；r 由本方流再生
     const uint64_t base = keys.reader.pos;
-    check_record_tags(keys.reader, base, 9, REC_OT16_RECV, n);
+    const uint64_t idx0 = keys.stream_pos(REC_OT16_RECV);
+    check_record_tags(keys.reader, base, 5, REC_OT16_RECV, n);
     std::vector<uint8_t> deltas(n), kr(n);
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 8192)
 #endif
     for (size_t e = 0; e < n; e++) {
-        uint64_t rec = base + 3 + e * 9;
-        uint8_t r = (uint8_t)keys.reader.get_at(rec, 4);
-        kr[e] = (uint8_t)keys.reader.get_at(rec + 4, 2);
+        uint8_t r = (uint8_t)(keys.prf(REC_OT16_RECV, idx0 + e, 0) & 15);
+        kr[e] = (uint8_t)keys.reader.get_at(base + 3 + e * 5, 2);
         deltas[e] = (r - d[e]) & 15;
     }
-    keys.reader.pos = base + 9 * n;
+    keys.reader.pos = base + 5 * n;
+    keys.stream_advance(REC_OT16_RECV, n);
 
     std::vector<uint8_t> snd((n * 4 + 7) / 8);
     pack_small(snd.data(), deltas.data(), n, 4);
@@ -130,28 +138,41 @@ void LssParty::ot16_recv(const uint8_t *d, uint8_t *out, size_t n) {
 // ── 原语 3：MUX ─────────────────────────────────────────────────────
 // e = open(β ⊕ a^b), f = open(x − b)
 // e==0: z_i = c_i + a^a_i·f ;  e==1: z_i = x_i − c_i − a^a_i·f
+// LSS2：ab/aa0/bb 双方 PRF 再生；P0 显式 cc0（64 bit），P1 显式 aa1（2 bit
+// 编码：0→0, 1→1, 2→2⁶⁴−1），cc1 由 P1 流再生。
 void LssParty::mux(const uint8_t *b, const uint64_t *x, uint64_t *z, size_t n) {
-    // MUX_TRIPLE 记录：3(tag)+193 = 196 bit/条
+    // MUX_TRIPLE 记录：P0 = 3+64 = 67 bit/条；P1 = 3+2 = 5 bit/条
+    const unsigned rec_bits = (party == 0) ? 67 : 5;
     const uint64_t base = keys.reader.pos;
-    check_record_tags(keys.reader, base, 196, REC_MUX_TRIPLE, n);
+    const uint64_t idx0 = keys.stream_pos(REC_MUX_TRIPLE);
+    check_record_tags(keys.reader, base, rec_bits, REC_MUX_TRIPLE, n);
 
     const size_t ebytes = (n + 7) / 8;
     std::vector<uint8_t> snd(ebytes + n * 8), rcv(snd.size());
     std::vector<uint64_t> aa(n), cc(n);
     std::vector<uint8_t> ab(n);
+    const int me_p = party;
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 4096)
 #endif
     for (size_t i = 0; i < n; i++) {
-        uint64_t rec = base + 3 + i * 196;
-        ab[i] = (uint8_t)keys.reader.get_at(rec, 1);
-        aa[i] = keys.reader.get_at(rec + 1, 64);
-        uint64_t bb = keys.reader.get_at(rec + 65, 64);
-        cc[i] = keys.reader.get_at(rec + 129, 64);
+        uint64_t idx = idx0 + i;
+        uint64_t w0 = keys.prf(REC_MUX_TRIPLE, idx, 0);
+        ab[i] = (uint8_t)(w0 & 1);
+        uint64_t bb = keys.prf(REC_MUX_TRIPLE, idx, 1);
+        if (me_p == 0) {
+            aa[i] = (w0 >> 1) & 1;
+            cc[i] = keys.reader.get_at(base + 3 + i * 67, 64);
+        } else {
+            uint64_t enc = keys.reader.get_at(base + 3 + i * 5, 2);
+            aa[i] = (enc == 0) ? 0 : (enc == 1 ? 1 : ~0ULL); // 2 → 2^64−1
+            cc[i] = keys.prf(REC_MUX_TRIPLE, idx, 2);
+        }
         uint64_t f = x[i] - bb;
         memcpy(snd.data() + ebytes + i * 8, &f, 8);
     }
-    keys.reader.pos = base + 196 * n;
+    keys.reader.pos = base + (uint64_t)rec_bits * n;
+    keys.stream_advance(REC_MUX_TRIPLE, n);
     // e 位 = b ⊕ a^b，打包（1 bit/元素）放在 f 数组之前
     std::vector<uint8_t> ebits(n);
 #ifdef _OPENMP
@@ -181,23 +202,29 @@ void LssParty::mux(const uint8_t *b, const uint64_t *x, uint64_t *z, size_t n) {
 
 // ── 原语 4：B2A ─────────────────────────────────────────────────────
 // e = open(β ⊕ rb)；e==0: z_i = ra_i；e==1: z_i = [i==0] − ra_i
+// LSS2：rb 双方 PRF 再生；ra0 由 P0 流再生，ra1 显式存 P1（64 bit）。
 void LssParty::b2a(const uint8_t *b, uint64_t *z, size_t n) {
-    // B2A_CORR 记录：3(tag)+65 = 68 bit/条
+    // B2A_CORR 记录：P0 = 3 bit/条；P1 = 3+64 = 67 bit/条
+    const unsigned rec_bits = (party == 0) ? 3 : 67;
     const uint64_t base = keys.reader.pos;
-    check_record_tags(keys.reader, base, 68, REC_B2A_CORR, n);
+    const uint64_t idx0 = keys.stream_pos(REC_B2A_CORR);
+    check_record_tags(keys.reader, base, rec_bits, REC_B2A_CORR, n);
 
     std::vector<uint8_t> ebits(n);
     std::vector<uint64_t> ra(n);
+    const int me_p = party;
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 8192)
 #endif
     for (size_t i = 0; i < n; i++) {
-        uint64_t rec = base + 3 + i * 68;
-        uint8_t rb = (uint8_t)keys.reader.get_at(rec, 1);
-        ra[i] = keys.reader.get_at(rec + 1, 64);
+        uint64_t idx = idx0 + i;
+        uint8_t rb = (uint8_t)(keys.prf(REC_B2A_CORR, idx, 0) & 1);
+        ra[i] = (me_p == 0) ? keys.prf(REC_B2A_CORR, idx, 1)
+                            : keys.reader.get_at(base + 3 + i * 67, 64);
         ebits[i] = b[i] ^ rb;
     }
-    keys.reader.pos = base + 68 * n;
+    keys.reader.pos = base + (uint64_t)rec_bits * n;
+    keys.stream_advance(REC_B2A_CORR, n);
 
     std::vector<uint8_t> snd((n + 7) / 8), rcv(snd.size());
     pack_small(snd.data(), ebits.data(), n, 1);

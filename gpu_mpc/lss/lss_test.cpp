@@ -106,10 +106,11 @@ static bool do_keygen(const std::string &dir) {
         }
     }
     // 每元素（bw=64 ReLU）key 核算：compare63 = 16 OT16 + 26 triple，+1 MUX
+    // LSS2：P0 显式 = 26×c0(1) + cc0(64)；P1 显式 = 16×k_r(2) + aa1(2)
     {
-        double bits0 = 16.0 * 35 + 26.0 * 6 + 196; // party0 (OT sender)
-        double bits1 = 16.0 * 9 + 26.0 * 6 + 196;  // party1 (OT receiver)
-        printf("[keygen] 每 ReLU 元素 key: party0=%.1f B  party1=%.1f B\n",
+        double bits0 = 16.0 * 3 + 26.0 * 4 + 67; // party0 (OT sender)
+        double bits1 = 16.0 * 5 + 26.0 * 3 + 5;  // party1 (OT receiver)
+        printf("[keygen] 每 ReLU 元素 key (LSS2): party0=%.2f B  party1=%.2f B\n",
                bits0 / 8, bits1 / 8);
     }
     return true;

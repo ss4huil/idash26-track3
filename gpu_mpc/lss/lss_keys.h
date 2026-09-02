@@ -1,10 +1,13 @@
-// lss_keys.h — LSS dealer key 文件格式 v1（gpu-mpc-track v2 Phase 1）
+// lss_keys.h — LSS dealer key 文件格式 v2（"LSS2"，种子压缩；gpu-mpc-track v2）
 //
 // 协议公式与格式的权威定义见同目录 lss_protocol.md；本文件只实现
 // 字节级布局。要点：
-//   - 文件 = 32B header + 比特打包记录流 + 24B trailer；
+//   - 文件 = 88B header（含 7 条 PRF 流的种子）+ 比特打包记录流 + 24B trailer；
 //   - 记录流为单一连续比特流，LSB-first；每条记录以 3-bit 类型标签开头；
-//   - 两方文件记录严格同序（OT16 一方为 SEND 记录、另一方为 RECV 记录）。
+//   - 两方文件记录严格同序（OT16 一方为 SEND 记录、另一方为 RECV 记录）；
+//   - LSS2：每方每记录类型一条计数器模式 PRF 流（种子在 header），记录中
+//     纯随机的份额全部由种子现场再生，只显式存储相关性修正——见
+//     lss_protocol.md §9（Matchmaker ePrint 2025/424 §3.4 + App. H 的思路）。
 //
 // 安全假设：dealer 半诚实且不与任一方合谋（比赛 Q3 允许）；在线无 dealer。
 #pragma once
@@ -20,15 +23,19 @@ namespace lss {
 
 // ── 记录类型标签（3 bit）────────────────────────────────────────────
 enum RecordType : uint8_t {
-    REC_BIT_TRIPLE = 0,  // 布尔 Beaver 三元组份额 (a,b,c=a∧b)，3 bit 负载
-    REC_OT16_SEND  = 1,  // 1oo16 OT sender：16 个 2-bit pad
-    REC_OT16_RECV  = 2,  // 1oo16 OT receiver：r(4bit) + pad_r(2bit)
-    REC_MUX_TRIPLE = 3,  // 选择三元组：a^b(1) + a^a(64) + b(64) + c(64)
-    REC_B2A_CORR   = 4,  // B2A 相关性：rb(1) + ra(64)
-    REC_MASK_IN    = 5,  // 桥接入口 mask 份额 r_p（u64）：eval 各方从 masked-public
-                         // m = x+r 恢复 x 的份额（P0: x0=m−r0, P1: x1=−r1）
-    REC_MASK_OUT   = 6,  // 桥接出口 mask 份额 r'_p（u64）：LSS 输出份额加 r'
-                         // 后重构，恢复 masked-public
+    REC_BIT_TRIPLE = 0,  // 布尔 Beaver 三元组份额：a_i,b_i 种子再生，
+                         //   P1 的 c1 种子再生，P0 显式存 c0=(a∧b)⊕c1（1 bit）
+    REC_OT16_SEND  = 1,  // 1oo16 OT sender：16 个 2-bit pad 全种子再生
+    REC_OT16_RECV  = 2,  // 1oo16 OT receiver：r 种子再生，k_r 显式（2 bit）
+    REC_MUX_TRIPLE = 3,  // 选择三元组：ab/aa0/bb 双方种子再生；
+                         //   P0 显式存 cc0（64 bit），P1 显式存 aa1∈{0,1,−1}（2 bit）
+    REC_B2A_CORR   = 4,  // B2A：rb 双方种子再生；ra0 P0 种子再生，ra1 显式（64 bit）
+    REC_MASK_IN    = 5,  // 桥接入口 mask 份额 r_p：P0 份额种子再生，
+                         //   P1 显式存 r_in−r0（64 bit；r_in 由管线给定不可压缩）：
+                         //   eval 各方从 masked-public m = x+r 恢复 x 的份额
+                         //   （P0: x0=m−r0, P1: x1=−r1）
+    REC_MASK_OUT   = 6,  // 桥接出口 mask 份额 r'_p：双方种子再生（dealer 定义
+                         //   r' = s0+s1），零显式字节；LSS 输出份额加 r' 后重构
 };
 
 inline const char *record_type_name(uint8_t t) {
@@ -45,18 +52,40 @@ inline const char *record_type_name(uint8_t t) {
 }
 
 // ── 文件常量 ────────────────────────────────────────────────────────
-constexpr uint8_t  LSS_MAGIC[4]   = {'L', 'S', 'S', '1'};
-constexpr uint32_t LSS_VERSION    = 1;
-constexpr size_t   LSS_HEADER_SZ  = 32;
+constexpr uint8_t  LSS_MAGIC[4]   = {'L', 'S', 'S', '2'};
+constexpr uint32_t LSS_VERSION    = 2;
+constexpr size_t   LSS_NUM_SEEDS  = 7;   // 每记录类型一条 PRF 流（含 OT16 两角色）
+constexpr size_t   LSS_HEADER_SZ  = 32 + LSS_NUM_SEEDS * 8; // 88 B
 constexpr size_t   LSS_TRAILER_SZ = 24;
 
-// 每条记录的负载 bit 数（不含 3-bit 标签）
-constexpr unsigned BITS_BIT_TRIPLE = 3;
-constexpr unsigned BITS_OT16_SEND  = 32;
-constexpr unsigned BITS_OT16_RECV  = 6;
-constexpr unsigned BITS_MUX_TRIPLE = 193;
-constexpr unsigned BITS_B2A_CORR   = 65;
-constexpr unsigned BITS_MASK       = 64; // MASK_IN / MASK_OUT
+// ── LSS2 计数器模式 PRF（随机访问：在线 get_at 并行消费要求可按序号再生）──
+// splitmix64 混合器；记录 i 的第 word 个输出字 = lss_prf(seed, i*STRIDE+word)。
+// TODO(production/最终提交): 换 AES-CTR（每记录 1 个 128-bit 分组，计数器 =
+// record_idx，不同流用不同 key/IV）以满足 128-bit 安全声明；splitmix64 只是
+// 正确性/体积验证阶段的占位 PRF（见 lss_protocol.md §9 安全讨论）。
+constexpr uint64_t LSS_PRF_STRIDE = 4; // 每条记录最多用 4 个 PRF 输出字
+
+inline uint64_t lss_prf(uint64_t seed, uint64_t ctr) {
+    uint64_t x = seed ^ (ctr * 0x9E3779B97F4A7C15ULL);
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// 每条记录的总 bit 数（含 3-bit 标签）按 (类型, party) 定长——随机访问
+// 定位与标签校验都依赖定长。party 只接受 0/1。
+inline unsigned record_total_bits(uint8_t t, int party) {
+    switch (t) {
+        case REC_BIT_TRIPLE: return party == 0 ? 4 : 3;  // P0: tag+c0
+        case REC_OT16_SEND:  return 3;                   // tag only
+        case REC_OT16_RECV:  return 5;                   // tag+k_r(2)
+        case REC_MUX_TRIPLE: return party == 0 ? 67 : 5; // P0: tag+cc0; P1: tag+aa1(2)
+        case REC_B2A_CORR:   return party == 0 ? 3 : 67; // P1: tag+ra1
+        case REC_MASK_IN:    return party == 0 ? 3 : 67; // P1: tag+(r_in−r0)
+        case REC_MASK_OUT:   return 3;                   // tag only
+        default:             return 0;
+    }
+}
 
 // ── Millionaires 结构计数（keygen 与在线必须一致，见 lss_protocol.md §5）──
 // radix-2^4 分块：digit 数 = ceil(bitlength/4)，顶层 digit 可能不足 4 bit
@@ -187,6 +216,7 @@ struct LssHeader {
     uint32_t party;
     uint64_t num_records;
     uint64_t payload_bits;
+    uint64_t seeds[LSS_NUM_SEEDS]; // 本方各记录类型的 PRF 流种子（LSS2）
 };
 
 inline void write_header(FILE *f, const LssHeader &h) {
@@ -198,6 +228,7 @@ inline void write_header(FILE *f, const LssHeader &h) {
     memcpy(hdr + 8, &h.party, 4);
     memcpy(hdr + 16, &h.num_records, 8);
     memcpy(hdr + 24, &h.payload_bits, 8);
+    memcpy(hdr + 32, h.seeds, LSS_NUM_SEEDS * 8);
     if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr))
         throw std::runtime_error("lss: 写 header 失败");
 }
@@ -207,7 +238,9 @@ inline LssHeader read_header(FILE *f) {
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr))
         throw std::runtime_error("lss: 读 header 失败");
     if (memcmp(hdr, LSS_MAGIC, 4) != 0)
-        throw std::runtime_error("lss: magic 不匹配，不是 LSS key 文件");
+        throw std::runtime_error(
+            "lss: magic 不匹配，不是 LSS2 key 文件（LSS1 与 LSS2 不兼容，"
+            "keygen 与 eval 必须用同一格式版本重新生成）");
     uint32_t ver;
     memcpy(&ver, hdr + 4, 4);
     if (ver != LSS_VERSION)
@@ -216,6 +249,7 @@ inline LssHeader read_header(FILE *f) {
     memcpy(&h.party, hdr + 8, 4);
     memcpy(&h.num_records, hdr + 16, 8);
     memcpy(&h.payload_bits, hdr + 24, 8);
+    memcpy(h.seeds, hdr + 32, LSS_NUM_SEEDS * 8);
     return h;
 }
 
@@ -286,8 +320,28 @@ public:
     // 游标回卷：eval 基准流程每次 forward 复用同一 key 流（与 FSS 侧
     // keyBuf = startPtr 复位同款纪律；注意这意味着 benchmark 的 11 次迭代
     // 复用同一批相关性——仅用于计时/精度验证，生产必须每批生成新 key）。
-    void rewind() { reader.pos = 0; }
+    void rewind() {
+        reader.pos = 0;
+        memset(ctr_, 0, sizeof(ctr_));
+    }
     bool exhausted() const { return reader.exhausted(); }
+
+    // ── LSS2 PRF 流访问（eval 侧）───────────────────────────────────
+    // OT16 的 SEND/RECV 是同一逻辑相关性的两面，共用一条流计数器。
+    static unsigned stream_slot(uint8_t t) {
+        return t == REC_OT16_RECV ? (unsigned)REC_OT16_SEND : (unsigned)t;
+    }
+    // 当前该类型下一条记录的流内序号（PRF 索引基准）
+    uint64_t stream_pos(uint8_t t) const { return ctr_[stream_slot(t)]; }
+    void stream_advance(uint8_t t, uint64_t n) { ctr_[stream_slot(t)] += n; }
+    // 本方记录 rec_idx（流内序号）的第 word 个 PRF 输出字
+    uint64_t prf(uint8_t seed_slot, uint64_t rec_idx, unsigned word) const {
+        return lss_prf(header.seeds[seed_slot],
+                       rec_idx * LSS_PRF_STRIDE + word);
+    }
+
+private:
+    uint64_t ctr_[LSS_NUM_SEEDS] = {}; // 每类型的已消费记录数（PRF 索引）
 };
 
 } // namespace lss

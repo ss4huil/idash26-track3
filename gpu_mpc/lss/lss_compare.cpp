@@ -211,38 +211,47 @@ void LssParty::relu_bridged(const uint64_t *h_m, uint64_t *h_out, size_t n,
     if (keys.exhausted()) keys.rewind(); // benchmark 迭代复用（见头注释）
     LssTimer t_bridge;
 
-    // 入口：m → x 的算术份额。MASK_IN 记录：3(tag)+64 = 67 bit/条
+    // 入口：m → x 的算术份额。MASK_IN 记录（LSS2）：P0 = 3 bit/条（份额
+    // PRF 再生）；P1 = 3+64 = 67 bit/条（显式存 r_in−r0）
+    const unsigned in_bits = (party == 0) ? 3 : 67;
     const uint64_t base_in = keys.reader.pos;
-    check_record_tags(keys.reader, base_in, 67, REC_MASK_IN, n);
+    const uint64_t idx_in = keys.stream_pos(REC_MASK_IN);
+    check_record_tags(keys.reader, base_in, in_bits, REC_MASK_IN, n);
     std::vector<uint64_t> x(n);
+    const int me_p = party;
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 8192)
 #endif
     for (size_t i = 0; i < n; i++) {
-        uint64_t rec = base_in + 3 + i * 67;
-        uint64_t rp = keys.reader.get_at(rec, 64);
-        x[i] = (party == 0) ? (h_m[i] - rp) : (0ULL - rp);
+        uint64_t rp = (me_p == 0)
+                          ? keys.prf(REC_MASK_IN, idx_in + i, 0)
+                          : keys.reader.get_at(base_in + 3 + i * 67, 64);
+        x[i] = (me_p == 0) ? (h_m[i] - rp) : (0ULL - rp);
     }
-    keys.reader.pos = base_in + 67 * n;
+    keys.reader.pos = base_in + (uint64_t)in_bits * n;
+    keys.stream_advance(REC_MASK_IN, n);
     us_bridge += t_bridge.us();  // 入口段
 
     // LSS relu
     std::vector<uint64_t> y(n);
     relu(x.data(), y.data(), n, bw);
 
-    // 出口：加新 mask 份额并重构（双方交换 w_p，各得 m' = relu(x) + r'）
+    // 出口：加新 mask 份额并重构（双方交换 w_p，各得 m' = relu(x) + r'）。
+    // MASK_OUT 记录（LSS2）：tag only 3 bit/条，份额双方 PRF 再生。
     LssTimer t_out;
     const uint64_t base_out = keys.reader.pos;
-    check_record_tags(keys.reader, base_out, 67, REC_MASK_OUT, n);
+    const uint64_t idx_out = keys.stream_pos(REC_MASK_OUT);
+    check_record_tags(keys.reader, base_out, 3, REC_MASK_OUT, n);
     std::vector<uint64_t> w(n), wp(n);
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 8192)
 #endif
     for (size_t i = 0; i < n; i++) {
-        uint64_t rp = keys.reader.get_at(base_out + 3 + i * 67, 64);
+        uint64_t rp = keys.prf(REC_MASK_OUT, idx_out + i, 0);
         w[i] = y[i] + rp;
     }
-    keys.reader.pos = base_out + 67 * n;
+    keys.reader.pos = base_out + 3 * n;
+    keys.stream_advance(REC_MASK_OUT, n);
     chan.exchange(w.data(), wp.data(), n * 8);
 #ifdef _OPENMP
 #pragma omp parallel for if(n > 8192)

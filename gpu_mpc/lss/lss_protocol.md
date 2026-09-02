@@ -1,4 +1,4 @@
-# LSS 在线原语协议规范（v2 Phase 1）
+# LSS 在线原语协议规范（v2 Phase 1；key 格式 LSS2）
 
 > 本文档是 `gpu_mpc/lss/` 的协议唯一权威定义。写代码前先定公式；
 > 任何实现与本文档不一致时以本文档为准（或先改本文档再改代码）。
@@ -7,6 +7,9 @@
 >
 > 安全假设（与比赛 Q3 一致）：dealer **半诚实且不与任一方合谋**；
 > 在线阶段无 dealer。两方均为半诚实。环 = Z_{2^64}。
+>
+> 当前 key 文件格式为 **LSS2**（种子压缩，§9）；§8 的 LSS1 布局已被取代，
+> 仅留作对照。LSS1 与 LSS2 文件互不兼容（magic/版本号强校验）。
 
 ## 记号
 
@@ -138,19 +141,20 @@ DReLU(x) = 1{x ≥ 0} = ¬msb(x)：布尔份额本地取反（仅 party0 翻转�
 ReLU(x) = MUX(DReLU(x), x)：x ≥ 0（有符号）输出 x，否则输出 0。
 = MSB（内含 1 次 63-bit 比较）+ 本地取反 + 1 次 MUX。
 
-**每元素核算（bw=64，16 OT16 + 26 triple + 1 MUX，实测与理论一致）**：
+**每元素核算（bw=64，16 OT16 + 26 triple + 1 MUX）**：
 
 | 项 | party0（OT sender） | party1（OT receiver） |
 |---|---|---|
-| key/元素 | 16×35 + 26×6 + 196 bit = **114.0 B** | 16×9 + 26×6 + 196 bit = **62.0 B** |
+| key/元素（LSS2，§9） | 16×3 + 26×4 + 67 bit = **27.4 B** | 16×5 + 26×3 + 5 bit = **20.4 B** |
+| key/元素（LSS1，已取代） | 16×35 + 26×6 + 196 bit = 114.0 B | 16×9 + 26×6 + 196 bit = 62.0 B |
 | 在线通信/元素 | 发送 70.5 B（不含结果 open） | 发送 14.5 B |
 | 轮次 | 6（叶子 OT 1 + AND 树 4 + MUX 1） | 同左 |
 
-⚠️ key 显式存储未达设计文档 §6 的 ~16–20 B/元素目标：OT16 pad（70 B）
-与 MUX 的 b/c 份额（16 B）均为 dealer PRG 输出，可种子化压缩
-（设计文档 Phase 2 的 PRF 压缩项）；显式残量 ≈ 22 B。
+LSS2 已把 OT16 pad 与 MUX 的 b/c 份额种子化（§9），显式残量：
+party0 = 26×c0(1 bit) + cc0(64 bit) ≈ 11.3 B/元素；
+party1 = 16×k_r(2 bit) + aa1(2 bit) ≈ 4.3 B/元素。
 
-## key 文件格式 v1（`lss_keys_party{0,1}.bin`）
+## key 文件格式 v1（`lss_keys_party{0,1}.bin`）—— ⚠️ 已被 LSS2（§9）取代，仅留作对照
 
 - 与 FSS key 文件**分离**（P3 再决定是否合并）。两侧记录严格同序。
 - Header（32 B，字节对齐）：magic "LSS1"(4B) | version u32=1 | party u32 |
@@ -176,9 +180,10 @@ ReLU(x) = MUX(DReLU(x), x)：x ≥ 0（有符号）输出 x，否则输出 0。
 
 ## PRG 说明
 
-dealer 用 `std::mt19937_64`（种子由参数给定，确定性可复现）。
-统计上均匀独立，对"dealer 直给"模型的半诚实安全性足够；
-**生产环境建议换 AES-CTR**（TODO，见汇报遗留问题）。
+LSS2：master seed 派生 2×7 条计数器模式 PRF 流种子（mt19937_64 仅用于
+这一步派生），记录内容全部由流种子按记录序号再生（§9）。
+**生产/最终提交须把占位 PRF（splitmix64 混合器）换成 AES-CTR**，
+以满足 128-bit 安全声明（TODO，见 §9 与 lss_keys.h）。
 
 ## 8. GPU 管线桥接（P3，设计文档 §5.2）
 
@@ -201,5 +206,69 @@ n×MASK_OUT，eval 按同序消费（标签校验防图序错位）。
 集成开关：`DDG_LSS_RELU=1`（默认关闭，保持 P0 FSS 路径可回归）；
 `DDG_LSS_PORT`（默认 43003，与 GpuPeer 42003 并行）。mode==2
 （ReluExtend）不分流，仍走 FSS 原路径。
-桥接代价：每元素 key +16 B（两个 mask 份额），通信 +16 B（出口重构），
-轮次 +1。
+桥接代价（LSS2）：每元素 key 仅 MASK_IN 的 P1 修正 +8 B（其余份额全部
+种子再生），通信 +16 B（出口重构），轮次 +1。
+
+## 9. key 文件格式 v2（"LSS2"，种子压缩）
+
+思路来自 Matchmaker（ePrint 2025/424）§3.4 + Appendix H：dealer 直给模型
+下，key 中"纯随机"的份额本来就是 dealer 自己采的——双方各持一条 PRF 流
+种子即可在线现场再生，文件只需显式存储**相关性修正**（不能由单方种子
+决定的跨方耦合项）。
+
+### 9.1 结构
+
+- **每方每记录类型一条逻辑 PRF 流**，共 7 条/方（BIT_TRIPLE、OT16_SEND、
+  OT16_RECV、MUX_TRIPLE、B2A_CORR、MASK_IN、MASK_OUT；OT16 两个角色
+  各一条，因为 sender/receiver 需要再生的内容不同）。
+- Header（88 B，字节对齐）：magic "LSS2"(4B) | version u32=2 | party u32 |
+  reserved u32 | num_records u64 | payload_bits u64 | seeds[7]（56 B）。
+  magic/版本强校验：LSS1 文件在 LSS2 代码下直接报错，不会静默错算。
+- 记录流仍是单一连续 LSB-first 比特流，每条记录以 3-bit 类型标签开头
+  （标签照旧校验防图序错位）。**记录定长但按 (类型, party) 不同**，
+  随机访问偏移 = base + i × record_total_bits(type, party)。
+- PRF：计数器模式，记录 i 的第 j 个输出字 =
+  `splitmix64(seed ^ ((i·4+j) · 0x9E3779B97F4A7C15))`（i = 流内记录序号，
+  与文件内 bit 偏移无关——在线 OpenMP 随机访问与 dealer 顺序生成用同一
+  序号，由每类型消费/生成计数器维护；`rewind()` 同时复位游标与计数器）。
+- Trailer（24 B）同 v1（num_records | payload_bytes | FNV-1a checksum）。
+
+### 9.2 各记录类型的压缩（bit 数含 3-bit 标签；"再生"= 由本方流种子算出）
+
+| 类型 | v1 (P0/P1) | v2 P0 | v2 P1 | 再生/显式划分 |
+|---|---|---|---|---|
+| BIT_TRIPLE | 6 / 6 | **4** | **3** | aᵢ,bᵢ 双方再生；c₁ 由 P1 流再生，c₀=(a∧b)⊕c₁ 显式存 P0（1 bit） |
+| OT16_SEND | 35 / — | **3** | — | 16 个 pad 全再生（word0 低 32 bit） |
+| OT16_RECV | — / 9 | — | **5** | r 再生（word0 低 4 bit）；k_r 显式（2 bit，dealer 从 sender 流反解） |
+| MUX_TRIPLE | 196 / 196 | **67** | **5** | ab、aa0、bb 双方再生；cc₁ 由 P1 流再生，cc₀=c−cc₁ 显式存 P0（64 bit）；aa₁=a−aa0∈{0,1,2⁶⁴−1} 以 2 bit 编码存 P1（0→0, 1→1, 2→2⁶⁴−1） |
+| B2A_CORR | 68 / 68 | **3** | **67** | rb 双方再生；ra0 由 P0 流再生，ra1=r−ra0 显式存 P1（64 bit） |
+| MASK_IN | 67 / 67 | **3** | **67** | r_in 由 GPU 管线给定、dealer 不可选 ⇒ 只能压一半：P0 份额再生，P1 显式存 r_in−r0 |
+| MASK_OUT | 67 / 67 | **3** | **3** | r' 由 dealer 定义为双方再生份额之和 s0+s1，零显式字节 |
+
+MUX 的 aa₁ 说明：aa₁ ∈ {0, 1, 2⁶⁴−1} 只有 3 个取值，2 bit 足够（v1 存了
+完整 64 bit）。MUX 的 cc 是环上随机 u64，无法双方都压缩（c=a·b 耦合双方
+的 a,b 份额），故一方再生、另一方显式 8 B——与 Matchmaker App. H 对
+ring-triple 的处理一致。
+
+### 9.3 分布与安全论证
+
+逐记录对比 v1/v2 的联合分布：v1 中 dealer 先采明文相关性再随机拆分；
+v2 等价地让"份额侧"的随机量全部由 PRF 流输出、明文相关性由份额反解
+（如 a := ab0⊕ab1、c₀ := (a∧b)⊕c₁）。在 PRF 输出与均匀随机不可区分的
+假设下，**每一方看到的份额分布与 v1 完全相同**（v1 里各方的份额本就
+是独立均匀的随机量加一个由对方随机量掩码的修正项），因此半诚实安全
+性归约到 PRF 的不可区分性，协议公式（§1–§7）本身一字未动。
+
+附加安全假设（相对 v1 的新增）：
+- PRF 种子即每方的全部秘密：key 文件的保密性与 v1 相同（v1 文件同样
+  包含全部份额），不引入新的密钥管理面；
+- ⚠️ 当前 PRF 是 splitmix64 占位（统计性质好但非密码学 PRF，且只有
+  64-bit 种子）。**最终提交必须换 AES-CTR**（128-bit key/计数器，每记录
+  一个分组）才能支撑 128-bit 安全声明——接口已是计数器模式，替换只动
+  `lss_prf` 一处。
+
+### 9.4 实测压缩效果
+
+见提交汇报；理论值（bw=64 桥接 ReLU，含 MASK_IN/OUT）：
+party0 = 3+16×3+26×4+67+3 = 225 bit ≈ 28.1 B/元素（v1 为 130 B），
+party1 = 67+16×5+26×3+5+3 = 233 bit ≈ 29.1 B/元素（v1 为 78 B）。
