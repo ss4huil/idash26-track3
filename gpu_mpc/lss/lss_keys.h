@@ -25,6 +25,10 @@ enum RecordType : uint8_t {
     REC_OT16_RECV  = 2,  // 1oo16 OT receiver：r(4bit) + pad_r(2bit)
     REC_MUX_TRIPLE = 3,  // 选择三元组：a^b(1) + a^a(64) + b(64) + c(64)
     REC_B2A_CORR   = 4,  // B2A 相关性：rb(1) + ra(64)
+    REC_MASK_IN    = 5,  // 桥接入口 mask 份额 r_p（u64）：eval 各方从 masked-public
+                         // m = x+r 恢复 x 的份额（P0: x0=m−r0, P1: x1=−r1）
+    REC_MASK_OUT   = 6,  // 桥接出口 mask 份额 r'_p（u64）：LSS 输出份额加 r'
+                         // 后重构，恢复 masked-public
 };
 
 inline const char *record_type_name(uint8_t t) {
@@ -34,6 +38,8 @@ inline const char *record_type_name(uint8_t t) {
         case REC_OT16_RECV:  return "OT16_RECV";
         case REC_MUX_TRIPLE: return "MUX_TRIPLE";
         case REC_B2A_CORR:   return "B2A_CORR";
+        case REC_MASK_IN:    return "MASK_IN";
+        case REC_MASK_OUT:   return "MASK_OUT";
         default:             return "<invalid>";
     }
 }
@@ -50,6 +56,7 @@ constexpr unsigned BITS_OT16_SEND  = 32;
 constexpr unsigned BITS_OT16_RECV  = 6;
 constexpr unsigned BITS_MUX_TRIPLE = 193;
 constexpr unsigned BITS_B2A_CORR   = 65;
+constexpr unsigned BITS_MASK       = 64; // MASK_IN / MASK_OUT
 
 // ── Millionaires 结构计数（keygen 与在线必须一致，见 lss_protocol.md §5）──
 // radix-2^4 分块：digit 数 = ceil(bitlength/4)，顶层 digit 可能不足 4 bit
@@ -206,6 +213,12 @@ public:
                 " 实为 " + record_type_name(got));
         return got;
     }
+
+    // 游标回卷：eval 基准流程每次 forward 复用同一 key 流（与 FSS 侧
+    // keyBuf = startPtr 复位同款纪律；注意这意味着 benchmark 的 11 次迭代
+    // 复用同一批相关性——仅用于计时/精度验证，生产必须每批生成新 key）。
+    void rewind() { reader.pos = 0; }
+    bool exhausted() const { return reader.exhausted(); }
 };
 
 } // namespace lss

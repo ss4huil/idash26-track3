@@ -47,8 +47,24 @@ public:
     //   gen_compare(count, bw−1) + count 条 MUX_TRIPLE。
     void gen_relu(uint64_t count, int bw = 64, int sender_party = 0);
 
+    // ── GPU 管线桥接版 ReLU（P3，设计文档 §5.2 最小侵入桥接）─────────
+    // dealer 在 keygen forward 中调用：r_in 为本算子输入张量的 mask
+    // （keygen 模式下 in.d_data 跟踪的正是 mask；两个 dealer 进程随机流
+    // 确定性一致，故 r_in 相同）。记录顺序 = eval 消费顺序：
+    //   n × MASK_IN（r_in 的份额）→ compare 记录 → n × MUX →
+    //   n × MASK_OUT（r_out 的份额）。
+    // r_out 由本函数采样并填出（dealer 把它作为输出张量的 mask 继续跟踪）。
+    void gen_relu_bridged(uint64_t n, int bw, const uint64_t *r_in,
+                          uint64_t *r_out, int sender_party = 0);
+
+    // 桥接 mask 记录（一般直接用 gen_relu_bridged；单独暴露便于组合）。
+    void gen_mask_records(RecordType type, const uint64_t *values, uint64_t n);
+
     // 写出双份 key 文件（含 header/trailer 校验）。
     void write_files(const std::string &path0, const std::string &path1) const;
+    // 单方写出：两个 dealer 进程各自只写自己的 key 文件（P3 集成用；
+    // 两进程相同 seed ⇒ 记录流一致）。
+    void write_file(const std::string &path, int party) const;
 
     uint64_t num_records() const { return nrecs_; }
     uint64_t payload_bits(int party) const { return w_[party].nbits; }

@@ -61,6 +61,18 @@ public:
     // ReLU(x) = MUX(DReLU(x), x)：x ≥ 0 输出 x，否则 0（算术份额）。
     void relu(const uint64_t *x, uint64_t *y, size_t n, int bw = 64);
 
+    // ── GPU 管线桥接版 ReLU（P3，设计文档 §5.2）─────────────────────
+    // 输入 h_m = masked-public 值 m = x + r（双方同持，已从 GPU 拉到 host）。
+    //   入口：读 n 条 MASK_IN 份额 r_p；P0: x0 = m − r0，P1: x1 = −r1；
+    //   LSS relu（compare + mux）；
+    //   出口：读 n 条 MASK_OUT 份额 r'_p，w_p = y_p + r'_p，双方交换重构
+    //         ⇒ h_out = relu(x) + r'（masked-public，+1 轮）。
+    // 若 key 流已耗尽（上一迭代刚好消费完）则自动回卷复用——与 FSS 侧
+    // 每迭代 keyBuf = startPtr 复位的 benchmark 纪律一致（仅用于计时/
+    // 精度验证，生产必须每批新 key）。
+    void relu_bridged(const uint64_t *h_m, uint64_t *h_out, size_t n,
+                      int bw = 64);
+
     // ── 测试/调试辅助：open ─────────────────────────────────────────
     void open_bits(const uint8_t *in, uint8_t *out, size_t n);   // XOR 重构
     void open_u64(const uint64_t *in, uint64_t *out, size_t n);  // 加法重构

@@ -153,4 +153,30 @@ void LssParty::relu(const uint64_t *x, uint64_t *y, size_t n, int bw) {
     mux(d.data(), x, y, n);
 }
 
+// ── P3 桥接版 ReLU（masked-public ↔ share 转换 + 重构出口）───────────
+void LssParty::relu_bridged(const uint64_t *h_m, uint64_t *h_out, size_t n,
+                            int bw) {
+    if (keys.exhausted()) keys.rewind(); // benchmark 迭代复用（见头注释）
+
+    // 入口：m → x 的算术份额
+    std::vector<uint64_t> x(n);
+    for (size_t i = 0; i < n; i++) {
+        keys.expect(REC_MASK_IN);
+        uint64_t rp = keys.reader.get(64);
+        x[i] = (party == 0) ? (h_m[i] - rp) : (0ULL - rp);
+    }
+    // LSS relu
+    std::vector<uint64_t> y(n);
+    relu(x.data(), y.data(), n, bw);
+    // 出口：加新 mask 份额并重构（双方交换 w_p，各得 m' = relu(x) + r'）
+    std::vector<uint64_t> w(n), wp(n);
+    for (size_t i = 0; i < n; i++) {
+        keys.expect(REC_MASK_OUT);
+        uint64_t rp = keys.reader.get(64);
+        w[i] = y[i] + rp;
+    }
+    chan.exchange(w.data(), wp.data(), n * 8);
+    for (size_t i = 0; i < n; i++) h_out[i] = w[i] + wp[i];
+}
+
 } // namespace lss

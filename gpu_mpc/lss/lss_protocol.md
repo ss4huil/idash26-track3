@@ -179,3 +179,27 @@ ReLU(x) = MUX(DReLU(x), x)：x ≥ 0（有符号）输出 x，否则输出 0。
 dealer 用 `std::mt19937_64`（种子由参数给定，确定性可复现）。
 统计上均匀独立，对"dealer 直给"模型的半诚实安全性足够；
 **生产环境建议换 AES-CTR**（TODO，见汇报遗留问题）。
+
+## 8. GPU 管线桥接（P3，设计文档 §5.2）
+
+GPU 管线中间值是 masked-public（双方同持 m = x + r，r 由前层 key 定）。
+LSS ReLU 需要 share 输入，桥接：
+
+- **入口**（记录 MASK_IN，u64 份额 r_p）：P0 本地 x0 = m − r0；
+  P1 本地 x1 = −r1。x0 + x1 = m − r = x ✓。
+- **LSS relu**：§5–7 的 compare + MUX。
+- **出口**（记录 MASK_OUT，u64 份额 r'_p）：w_p = y_p + r'_p，
+  双方交换重构 ⇒ 双方得 m' = relu(x) + r'（masked-public，+1 轮），
+  H2D 回 GPU 继续 matmul。
+
+dealer 一致性：keygen 模式下 in.d_data 即输入 mask（dealer 全程跟踪）；
+两个 dealer 进程随机流确定性一致（固定 seed），各自只写自己 party 的
+`..._party<p>_lss.bin`。每个 relu 算子的记录序列：
+n×MASK_IN → compare 记录（n×D OT16 + n×gates BIT_TRIPLE）→ n×MUX →
+n×MASK_OUT，eval 按同序消费（标签校验防图序错位）。
+
+集成开关：`DDG_LSS_RELU=1`（默认关闭，保持 P0 FSS 路径可回归）；
+`DDG_LSS_PORT`（默认 43003，与 GpuPeer 42003 并行）。mode==2
+（ReluExtend）不分流，仍走 FSS 原路径。
+桥接代价：每元素 key +16 B（两个 mask 份额），通信 +16 B（出口重构），
+轮次 +1。

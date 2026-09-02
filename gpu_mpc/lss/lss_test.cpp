@@ -32,6 +32,7 @@ constexpr size_t N_MUX  = 512;
 constexpr size_t N_B2A  = 256;
 constexpr size_t N_CMP  = 1024; // compare_gt 直接测试（64/63 bit 各一轮）
 constexpr size_t N_RELU = 1024; // msb + relu 测试
+constexpr size_t N_BRIDGE = 512; // P3 桥接 relu_bridged 测试
 
 constexpr uint64_t KEYGEN_SEED = 0xDEADBEEF42;
 constexpr uint64_t INPUT_SEED  = 0x1234567890AB; // 双方共享，推明文输入
@@ -58,6 +59,28 @@ static bool do_keygen(const std::string &dir) {
     kg.gen_compare(N_CMP, 63);      // 测试 6：63-bit compare（顶 digit 3 bit）
     kg.gen_compare(N_RELU, 63);     // 测试 7：msb
     kg.gen_relu(N_RELU, 64);        // 测试 8：relu
+    // 测试 9（P3 桥接）：dealer 已知输入 mask r_in，采样输出 mask r_out；
+    // 期望值 relu(x)+r_out 写 check 文件供两个 party 子进程校验。
+    {
+        std::mt19937_64 brng(INPUT_SEED + 1);
+        std::vector<uint64_t> r_in(N_BRIDGE), r_out(N_BRIDGE), expect(N_BRIDGE);
+        for (size_t i = 0; i < N_BRIDGE; i++) {
+            uint64_t x = (i < 8) ? (uint64_t[]){0, 1, (1ULL<<63)-1, 1ULL<<63,
+                                 (1ULL<<63)+1, UINT64_MAX, UINT64_MAX-1, 7}[i]
+                                 : brng();
+            r_in[i] = brng();
+            expect[i] = x; // 暂存 x
+        }
+        kg.gen_relu_bridged(N_BRIDGE, 64, r_in.data(), r_out.data());
+        for (size_t i = 0; i < N_BRIDGE; i++) {
+            uint64_t x = expect[i];
+            uint64_t rx = (x < (1ULL << 63)) ? x : 0;
+            expect[i] = rx + r_out[i];
+        }
+        FILE *f = fopen((dir + "/bridge_check.bin").c_str(), "wb");
+        fwrite(expect.data(), 8, N_BRIDGE, f);
+        fclose(f);
+    }
     std::string p0 = dir + "/lss_keys_party0.bin";
     std::string p1 = dir + "/lss_keys_party1.bin";
     kg.write_files(p0, p1);
@@ -308,6 +331,32 @@ static int run_party(int party, int port, const std::string &dir) {
                "  comm %.1f B/元素 sent\n",
                party, failures == f0 ? "全部通过" : "存在失败", failures - f0,
                (double)(P.chan.bytes_sent - sent0) / N_RELU);
+    }
+
+    // ── 测试 9：P3 桥接 relu_bridged（masked-public 进/出）──
+    {
+        // 双方用与 driver 相同的顺序从 brng 重建 x 与 r_in，构造 m = x + r_in
+        std::mt19937_64 brng(INPUT_SEED + 1);
+        std::vector<uint64_t> m(N_BRIDGE), m_out(N_BRIDGE);
+        for (size_t i = 0; i < N_BRIDGE; i++) {
+            uint64_t x = (i < 8) ? (uint64_t[]){0, 1, (1ULL<<63)-1, 1ULL<<63,
+                                 (1ULL<<63)+1, UINT64_MAX, UINT64_MAX-1, 7}[i]
+                                 : brng();
+            uint64_t r_in = brng();
+            m[i] = x + r_in;
+        }
+        int f0 = failures;
+        P.relu_bridged(m.data(), m_out.data(), N_BRIDGE, 64);
+        std::vector<uint64_t> expect(N_BRIDGE);
+        FILE *f = fopen((dir + "/bridge_check.bin").c_str(), "rb");
+        if (fread(expect.data(), 8, N_BRIDGE, f) != N_BRIDGE)
+            CHECK(false, "bridge_check.bin 读取失败");
+        fclose(f);
+        for (size_t i = 0; i < N_BRIDGE; i++)
+            CHECK(m_out[i] == expect[i],
+                  "relu_bridged 输出 != relu(x)+r_out（桥接 mask 不抵消?）");
+        printf("[party %d] relu_bridged: %s（%d 失败；masked-public 进/出）\n",
+               party, failures == f0 ? "全部通过" : "存在失败", failures - f0);
     }
 
     // key 必须恰好耗尽（图序对齐）

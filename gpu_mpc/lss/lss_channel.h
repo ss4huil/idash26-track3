@@ -28,6 +28,16 @@ public:
     ~Channel() { if (fd >= 0) ::close(fd); }
     Channel(const Channel &) = delete;
     Channel &operator=(const Channel &) = delete;
+    Channel(Channel &&o) noexcept : fd(o.fd), bytes_sent(o.bytes_sent),
+                                    bytes_recv(o.bytes_recv) { o.fd = -1; }
+    Channel &operator=(Channel &&o) noexcept {
+        if (this != &o) {
+            if (fd >= 0) ::close(fd);
+            fd = o.fd; bytes_sent = o.bytes_sent; bytes_recv = o.bytes_recv;
+            o.fd = -1;
+        }
+        return *this;
+    }
 
     // party 0：监听并接受一个连接
     static Channel listen_and_accept(int port) {

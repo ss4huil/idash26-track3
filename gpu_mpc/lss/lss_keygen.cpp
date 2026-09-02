@@ -114,24 +114,54 @@ void LssKeygen::gen_relu(uint64_t count, int bw, int sender_party) {
     gen_mux(count);
 }
 
-void LssKeygen::write_files(const std::string &path0, const std::string &path1) const {
-    for (int p = 0; p < 2; p++) {
-        const std::string &path = (p == 0 ? path0 : path1);
-        FILE *f = fopen(path.c_str(), "wb");
-        if (!f) throw std::runtime_error("lss: 无法写 key 文件 " + path);
-        LssHeader h;
-        h.party = (uint32_t)p;
-        h.num_records = nrecs_;
-        h.payload_bits = w_[p].nbits;
-        write_header(f, h);
-        const BitWriter &w = w_[p];
-        if (!w.buf.empty() &&
-            fwrite(w.buf.data(), 1, w.buf.size(), f) != w.buf.size())
-            throw std::runtime_error("lss: 写 payload 失败 " + path);
-        write_trailer(f, nrecs_, w.payload_bytes(),
-                      fnv1a64(w.buf.data(), w.buf.size()));
-        fclose(f);
+// ── P3 桥接 ─────────────────────────────────────────────────────────
+void LssKeygen::gen_mask_records(RecordType type, const uint64_t *values,
+                                 uint64_t n) {
+    // values 为完整 mask；party0 份额随机采样，party1 = values − share0。
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t s0 = rand64();
+        w_[0].put(type, 3);
+        w_[0].put(s0, 64);
+        w_[1].put(type, 3);
+        w_[1].put(values[i] - s0, 64);
     }
+    nrecs_ += n;
+}
+
+void LssKeygen::gen_relu_bridged(uint64_t n, int bw, const uint64_t *r_in,
+                                 uint64_t *r_out, int sender_party) {
+    gen_mask_records(REC_MASK_IN, r_in, n);
+    gen_compare(n, bw - 1, sender_party);
+    gen_mux(n);
+    // 采样输出 mask r' 并写份额
+    std::vector<uint64_t> rout(n);
+    for (uint64_t i = 0; i < n; i++) rout[i] = rand64();
+    gen_mask_records(REC_MASK_OUT, rout.data(), n);
+    for (uint64_t i = 0; i < n; i++) r_out[i] = rout[i];
+}
+
+void LssKeygen::write_files(const std::string &path0, const std::string &path1) const {
+    write_file(path0, 0);
+    write_file(path1, 1);
+}
+
+void LssKeygen::write_file(const std::string &path, int party) const {
+    if (party != 0 && party != 1)
+        throw std::runtime_error("lss: write_file party 必须是 0 或 1");
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("lss: 无法写 key 文件 " + path);
+    LssHeader h;
+    h.party = (uint32_t)party;
+    h.num_records = nrecs_;
+    h.payload_bits = w_[party].nbits;
+    write_header(f, h);
+    const BitWriter &w = w_[party];
+    if (!w.buf.empty() &&
+        fwrite(w.buf.data(), 1, w.buf.size(), f) != w.buf.size())
+        throw std::runtime_error("lss: 写 payload 失败 " + path);
+    write_trailer(f, nrecs_, w.payload_bytes(),
+                  fnv1a64(w.buf.data(), w.buf.size()));
+    fclose(f);
 }
 
 } // namespace lss
