@@ -7,9 +7,30 @@
 
 #include "lss_keys.h"
 #include "lss_channel.h"
+#include <chrono>
+#include <cstdlib>
 #include <random>
+#include <thread>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace lss {
+
+// 线程数：DDG_LSS_THREADS 覆盖，默认 hardware_concurrency（评测机 16 核）
+inline int lss_num_threads() {
+    const char *e = std::getenv("DDG_LSS_THREADS");
+    if (e && atoi(e) > 0) return atoi(e);
+    unsigned h = std::thread::hardware_concurrency();
+    return h ? (int)h : 1;
+}
+
+inline void lss_init_threads() {
+#ifdef _OPENMP
+    omp_set_num_threads(lss_num_threads());
+#endif
+}
 
 class LssParty {
 public:
@@ -21,7 +42,9 @@ public:
              uint64_t local_seed = 0)
         : party(party), keys(key_path), chan(chan),
           local_rng(local_seed ? (local_seed ^ (0x9E3779B97F4A7C15ULL * (party + 1)))
-                               : (uint64_t)std::random_device{}()) {}
+                               : (uint64_t)std::random_device{}()) {
+        lss_init_threads();
+    }
 
     // ── 原语 1：AND ─────────────────────────────────────────────────
     // x,y,z 为布尔份额（每元素 0/1）。z = AND(x,y) 的布尔份额。
@@ -80,6 +103,24 @@ public:
     // 本地 PRNG：OT16 sender 的掩码 s 等本地随机性（对端不可见，
     // 无需与 key 流对齐）。seed=0 时用 random_device。
     std::mt19937_64 local_rng;
+
+    // ── 分阶段耗时统计（微秒，性能分析用；退出时由集成层打印）─────────
+    uint64_t us_leaf = 0;    // 叶子 OT16（含 g 表/回复构造）
+    uint64_t us_tree = 0;    // AND 树
+    uint64_t us_mux = 0;     // MUX
+    uint64_t us_bridge = 0;  // 桥接入口/出口（mask 转换 + 出口重构）
+    uint64_t us_comm = 0;    // socket 收发（嵌套于上述各阶段内）
+};
+
+// 简单计时器
+struct LssTimer {
+    std::chrono::high_resolution_clock::time_point t0;
+    LssTimer() : t0(std::chrono::high_resolution_clock::now()) {}
+    uint64_t us() const {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now() - t0)
+            .count();
+    }
 };
 
 } // namespace lss

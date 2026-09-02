@@ -9,7 +9,14 @@
 //   叶子 OT16：全部 n×D 个一批，1 轮（1 次 RT）；
 //   AND 树：ceil(log2(D)) 层，每层一次 batched and_open，1 轮/层；
 //   ReLU 再 +1 轮 MUX。bw=64 的 ReLU 共 6 轮。
+//
+// 并行化（v2 性能项）：叶子 g 表构造、树收集/写回、桥接 mask 循环均为
+// 元素级数据并行（OpenMP，_OPENMP 宏守卫）；通信结构不变。
 #include "lss_online.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace lss {
 
@@ -35,11 +42,26 @@ void LssParty::compare_gt(uint8_t *out, const uint64_t *val, size_t n,
 
     std::vector<uint8_t> cmp(m), eq(m);
 
+    LssTimer t_leaf;
     // ── 叶子层：一批 OT16（1 轮）──
     if (party == 0) {
         // sender：g(i) = ((t>i)<<1)|(t==i)，t 为本方 digit；
-        // 掩码 s 来自本地 PRNG，同时即本方的 (cmp,eq) 份额。
+        // 掩码 s 来自本地 PRNG（串行生成，mt19937_64 非线程安全），
+        // 同时即本方的 (cmp,eq) 份额。
+        // g 的 16 入口是 t 的确定性模式：预计算 16×16 表，逐元素 memcpy。
+        static uint8_t G_TAB[16][16];
+        static bool g_tab_init = [] {
+            for (int t = 0; t < 16; t++)
+                for (int k = 0; k < 16; k++)
+                    G_TAB[t][k] = (uint8_t)(((t > k) << 1) | (t == k));
+            return true;
+        }();
+        (void)g_tab_init;
         std::vector<uint8_t> g(m * 16), s(m);
+        for (size_t e = 0; e < m; e++) s[e] = (uint8_t)(local_rng() & 3);
+#ifdef _OPENMP
+#pragma omp parallel for if(m > 8192)
+#endif
         for (size_t e = 0; e < m; e++) {
             size_t j = e / (size_t)D;
             int i = (int)(e % (size_t)D);
@@ -48,9 +70,7 @@ void LssParty::compare_gt(uint8_t *out, const uint64_t *val, size_t n,
                 t = (uint8_t)(val[j] >> (4 * i)) & ((1u << r) - 1);
             else
                 t = (uint8_t)(val[j] >> (4 * i)) & 15;
-            for (int k = 0; k < 16; k++)
-                g[e * 16 + k] = (uint8_t)(((t > k) << 1) | (t == k));
-            s[e] = (uint8_t)(local_rng() & 3);
+            memcpy(g.data() + e * 16, G_TAB[t], 16);
             cmp[e] = (s[e] >> 1) & 1;
             eq[e] = s[e] & 1;
         }
@@ -58,6 +78,9 @@ void LssParty::compare_gt(uint8_t *out, const uint64_t *val, size_t n,
     } else {
         // receiver：choice = 本方 digit
         std::vector<uint8_t> d(m), o(m);
+#ifdef _OPENMP
+#pragma omp parallel for if(m > 8192)
+#endif
         for (size_t e = 0; e < m; e++) {
             size_t j = e / (size_t)D;
             int i = (int)(e % (size_t)D);
@@ -67,53 +90,71 @@ void LssParty::compare_gt(uint8_t *out, const uint64_t *val, size_t n,
                 d[e] = (uint8_t)(val[j] >> (4 * i)) & 15;
         }
         ot16_recv(d.data(), o.data(), m);
+#ifdef _OPENMP
+#pragma omp parallel for if(m > 8192)
+#endif
         for (size_t e = 0; e < m; e++) {
             cmp[e] = (o[e] >> 1) & 1;
             eq[e] = o[e] & 1;
         }
     }
 
+    us_leaf += t_leaf.us();
+    LssTimer t_tree;
     // ── AND 树：逐层一批（每层 1 轮）──
     // 注意布局与叶子层一致：元素主序，cmp/eq 的下标 = k*D + digit。
+    // 缓冲跨层复用（避免每层 malloc）；层门数上界 2D（首层 i=1 最大，
+    // D=16 时 15 门 = 1+7×2）。
+    const size_t maxG = 2 * (size_t)D;
+    std::vector<uint8_t> xs(maxG * n), ys(maxG * n), zs(maxG * n);
     for (int i = 1; i < D; i <<= 1) {
-        // 先收集本层全部 AND 的输入（读旧状态），再统一写回
-        std::vector<uint8_t> xs, ys;
-        std::vector<int> dst_j;   // 每个 AND 对应的组下标 j
-        std::vector<bool> is_eq;  // 该 AND 是 eq 更新还是 cmp 更新
+        // 本层门描述（串行，数量 ≤ D/2）：j==0 组 1 门，其余组 2 门
+        std::vector<int> gate_j;
+        std::vector<bool> gate_is_eq;
         for (int j = 0; j + i < D; j += 2 * i) {
-            for (size_t k = 0; k < n; k++) {
-                xs.push_back(cmp[k * D + j]);
-                ys.push_back(eq[k * D + j + i]);
-            }
-            dst_j.push_back(j);
-            is_eq.push_back(false);
+            gate_j.push_back(j);
+            gate_is_eq.push_back(false);
             if (j > 0) {
-                for (size_t k = 0; k < n; k++) {
-                    xs.push_back(eq[k * D + j]);
-                    ys.push_back(eq[k * D + j + i]);
-                }
-                dst_j.push_back(j);
-                is_eq.push_back(true);
+                gate_j.push_back(j);
+                gate_is_eq.push_back(true);
             }
         }
-        std::vector<uint8_t> zs(xs.size());
-        and_open(xs.data(), ys.data(), zs.data(), xs.size());
-        // 写回：顺序与收集顺序一致
-        size_t pos = 0;
-        for (size_t gidx = 0; gidx < dst_j.size(); gidx++) {
-            int j = dst_j[gidx];
-            if (!is_eq[gidx]) {
-                for (size_t k = 0; k < n; k++)
-                    cmp[k * D + j] = zs[pos + k] ^ cmp[k * D + j + i];
+        const size_t G = gate_j.size();
+        // 并行收集本层全部 AND 输入（读旧状态），槽位 gidx*n + k
+#ifdef _OPENMP
+#pragma omp parallel for if(G * n > 8192)
+#endif
+        for (size_t idx = 0; idx < G * n; idx++) {
+            size_t gidx = idx / n, k = idx % n;
+            int j = gate_j[gidx];
+            if (!gate_is_eq[gidx]) {
+                xs[idx] = cmp[k * D + j];
+                ys[idx] = eq[k * D + j + i];
             } else {
-                for (size_t k = 0; k < n; k++)
-                    eq[k * D + j] = zs[pos + k];
+                xs[idx] = eq[k * D + j];
+                ys[idx] = eq[k * D + j + i];
             }
-            pos += n;
+        }
+        and_open(xs.data(), ys.data(), zs.data(), G * n);
+        // 并行写回：顺序与收集顺序一致
+#ifdef _OPENMP
+#pragma omp parallel for if(G * n > 8192)
+#endif
+        for (size_t idx = 0; idx < G * n; idx++) {
+            size_t gidx = idx / n, k = idx % n;
+            int j = gate_j[gidx];
+            if (!gate_is_eq[gidx])
+                cmp[k * D + j] = zs[idx] ^ cmp[k * D + j + i];
+            else
+                eq[k * D + j] = zs[idx];
         }
     }
 
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
     for (size_t k = 0; k < n; k++) out[k] = cmp[k * D];
+    us_tree += t_tree.us();
 }
 
 // ── MSB ─────────────────────────────────────────────────────────────
@@ -130,11 +171,17 @@ void LssParty::msb(const uint64_t *x, uint8_t *out, size_t n, int bw) {
     const int shift = bw - 1;
     const uint64_t mask = (shift == 64) ? ~0ULL : ((1ULL << shift) - 1);
     std::vector<uint64_t> v(n);
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
     for (size_t i = 0; i < n; i++) {
         v[i] = x[i] & mask;
         if (party == 1) v[i] = (mask - v[i]) & mask;
     }
     compare_gt(out, v.data(), n, bw - 1);
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
     for (size_t i = 0; i < n; i++)
         out[i] ^= (uint8_t)((x[i] >> shift) & 1);
 }
@@ -143,6 +190,9 @@ void LssParty::msb(const uint64_t *x, uint8_t *out, size_t n, int bw) {
 void LssParty::drelu(const uint64_t *x, uint8_t *out, size_t n, int bw) {
     msb(x, out, n, bw);
     if (party == 0)
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
         for (size_t i = 0; i < n; i++) out[i] ^= 1;
 }
 
@@ -150,33 +200,55 @@ void LssParty::drelu(const uint64_t *x, uint8_t *out, size_t n, int bw) {
 void LssParty::relu(const uint64_t *x, uint64_t *y, size_t n, int bw) {
     std::vector<uint8_t> d(n);
     drelu(x, d.data(), n, bw);
+    LssTimer t_mux;
     mux(d.data(), x, y, n);
+    us_mux += t_mux.us();
 }
 
 // ── P3 桥接版 ReLU（masked-public ↔ share 转换 + 重构出口）───────────
 void LssParty::relu_bridged(const uint64_t *h_m, uint64_t *h_out, size_t n,
                             int bw) {
     if (keys.exhausted()) keys.rewind(); // benchmark 迭代复用（见头注释）
+    LssTimer t_bridge;
 
-    // 入口：m → x 的算术份额
+    // 入口：m → x 的算术份额。MASK_IN 记录：3(tag)+64 = 67 bit/条
+    const uint64_t base_in = keys.reader.pos;
+    check_record_tags(keys.reader, base_in, 67, REC_MASK_IN, n);
     std::vector<uint64_t> x(n);
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
     for (size_t i = 0; i < n; i++) {
-        keys.expect(REC_MASK_IN);
-        uint64_t rp = keys.reader.get(64);
+        uint64_t rec = base_in + 3 + i * 67;
+        uint64_t rp = keys.reader.get_at(rec, 64);
         x[i] = (party == 0) ? (h_m[i] - rp) : (0ULL - rp);
     }
+    keys.reader.pos = base_in + 67 * n;
+    us_bridge += t_bridge.us();  // 入口段
+
     // LSS relu
     std::vector<uint64_t> y(n);
     relu(x.data(), y.data(), n, bw);
+
     // 出口：加新 mask 份额并重构（双方交换 w_p，各得 m' = relu(x) + r'）
+    LssTimer t_out;
+    const uint64_t base_out = keys.reader.pos;
+    check_record_tags(keys.reader, base_out, 67, REC_MASK_OUT, n);
     std::vector<uint64_t> w(n), wp(n);
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
     for (size_t i = 0; i < n; i++) {
-        keys.expect(REC_MASK_OUT);
-        uint64_t rp = keys.reader.get(64);
+        uint64_t rp = keys.reader.get_at(base_out + 3 + i * 67, 64);
         w[i] = y[i] + rp;
     }
+    keys.reader.pos = base_out + 67 * n;
     chan.exchange(w.data(), wp.data(), n * 8);
+#ifdef _OPENMP
+#pragma omp parallel for if(n > 8192)
+#endif
     for (size_t i = 0; i < n; i++) h_out[i] = w[i] + wp[i];
+    us_bridge += t_out.us();  // 出口段（不含 relu 本体）
 }
 
 } // namespace lss
