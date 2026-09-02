@@ -51,6 +51,22 @@ constexpr unsigned BITS_OT16_RECV  = 6;
 constexpr unsigned BITS_MUX_TRIPLE = 193;
 constexpr unsigned BITS_B2A_CORR   = 65;
 
+// ── Millionaires 结构计数（keygen 与在线必须一致，见 lss_protocol.md §5）──
+// radix-2^4 分块：digit 数 = ceil(bitlength/4)，顶层 digit 可能不足 4 bit
+// （仍用 OT16，只用前 2^r 个入口）。
+inline int lss_num_digits(int bitlength) { return (bitlength + 3) / 4; }
+
+// 每次比较的 AND 门数（AND 树，语义同 SCI traverse_and_compute_ANDs）：
+// 每层 stride i：j==0 组 1 门（cmp∧eq），其余组 2 门（+eq∧eq）。
+// num_digits=16 时 = 15+7+3+1 = 26。
+inline uint64_t lss_and_gates_per_compare(int num_digits) {
+    uint64_t g = 0;
+    for (int i = 1; i < num_digits; i <<= 1)
+        for (int j = 0; j + i < num_digits; j += 2 * i)
+            g += (j == 0) ? 1 : 2;
+    return g;
+}
+
 // ── 比特流（LSB-first：bit i → byte[i/8] 的第 i%8 位）────────────────
 class BitWriter {
 public:

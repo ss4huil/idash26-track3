@@ -7,6 +7,7 @@
 
 #include "lss_keys.h"
 #include "lss_channel.h"
+#include <random>
 
 namespace lss {
 
@@ -16,8 +17,11 @@ public:
     KeyFileReader keys;
     Channel &chan;
 
-    LssParty(int party, const std::string &key_path, Channel &chan)
-        : party(party), keys(key_path), chan(chan) {}
+    LssParty(int party, const std::string &key_path, Channel &chan,
+             uint64_t local_seed = 0)
+        : party(party), keys(key_path), chan(chan),
+          local_rng(local_seed ? (local_seed ^ (0x9E3779B97F4A7C15ULL * (party + 1)))
+                               : (uint64_t)std::random_device{}()) {}
 
     // ── 原语 1：AND ─────────────────────────────────────────────────
     // x,y,z 为布尔份额（每元素 0/1）。z = AND(x,y) 的布尔份额。
@@ -40,9 +44,30 @@ public:
     // b 布尔份额；z = b 的算术份额（z0 + z1 ≡ β mod 2^64）。
     void b2a(const uint8_t *b, uint64_t *z, size_t n);
 
+    // ── 算子层（P2，实现在 lss_compare.cpp，公式见 lss_protocol.md §5-7）──
+    // Millionaires 比较（radix-2^4，party0 恒为 OT sender）：
+    //   val 为本方明文输入（party0 的 a / party1 的 b），
+    //   out = 1{a > b} 的布尔份额。语义对齐 SCI millionaire.h compare
+    //   （greater_than=true）；1{x<y} 可由双方互换输入获得。
+    void compare_gt(uint8_t *out, const uint64_t *val, size_t n, int bitlength);
+
+    // MSB：msb(x) = msb(x0) ⊕ msb(x1) ⊕ wrap，wrap = 1{b0+b1 ≥ 2^(bw−1)}
+    // 由 (bw−1)-bit compare_gt 得到（推导见 lss_protocol.md §6）。
+    void msb(const uint64_t *x, uint8_t *out, size_t n, int bw = 64);
+
+    // DReLU(x) = 1{x ≥ 0}（有符号语义）= ¬msb(x) 的布尔份额（本地翻转）。
+    void drelu(const uint64_t *x, uint8_t *out, size_t n, int bw = 64);
+
+    // ReLU(x) = MUX(DReLU(x), x)：x ≥ 0 输出 x，否则 0（算术份额）。
+    void relu(const uint64_t *x, uint64_t *y, size_t n, int bw = 64);
+
     // ── 测试/调试辅助：open ─────────────────────────────────────────
     void open_bits(const uint8_t *in, uint8_t *out, size_t n);   // XOR 重构
     void open_u64(const uint64_t *in, uint64_t *out, size_t n);  // 加法重构
+
+    // 本地 PRNG：OT16 sender 的掩码 s 等本地随机性（对端不可见，
+    // 无需与 key 流对齐）。seed=0 时用 random_device。
+    std::mt19937_64 local_rng;
 };
 
 } // namespace lss

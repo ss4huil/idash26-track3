@@ -83,6 +83,73 @@ Dealer：采样 r ← {0,1}；发双方 r 的布尔份额 rb_i（1 bit）和算�
 正确性：e=0 时 β=r，z = r ✓；e=1 时 β = 1−r，z0+z1 = 1 − r ✓。
 通信：双向各 1 bit，1 轮。
 
+## 5. Millionaires 比较 compare_gt（P2 算子层）
+
+语义：party0 持明文 a、party1 持明文 b（各自本地已知，实际用途是各自的
+share 值），输出 1{a > b} 的布尔份额。对齐 SCI `millionaire.h` 的
+`compare(greater_than=true)`；1{x<y} 由双方互换输入得到。party0 恒为
+OT sender。
+
+结构（bitlength ∈ [1,64]，D = ceil(bitlength/4) 个 digit，radix-2^4；
+顶层 digit 可能只有 r = bitlength mod 4 个有效 bit，仍用 OT16，只用前
+2^r 个入口）：
+
+- **叶子层**（digit i 从 LSB 编号 0..D−1）：每 digit 一个 OT16，
+  sender 的明文函数 g(k) = ((t>k)<<1)|(t==k)（t = 本方 digit），
+  掩码 s（2 bit）来自 sender 本地 PRNG、同时即 sender 的份额；
+  receiver choice = 本方 digit。产出布尔份额对：
+  cmp_i = 1{a 的 digit_i > b 的 digit_i}（payload 高 bit），
+  eq_i = 1{digit 相等}（低 bit；digit 0 的 eq 不使用——严格大于的
+  组合中 LSB 的 eq 无意义，与 SCI 一致）。
+  全部 n×D 个 OT 一批调用，**1 轮**。
+- **AND 树**（stride i = 1,2,4,...，ceil(log2 D) 层，每层 1 轮）：
+  组 j 覆盖 digit 段 [j, j+i)。同层所有 AND 收集后一次 batched
+  and_open，再统一写回（组内先读后写安全）：
+  - j==0 组（LSB 组，无 eq）：cmp[j] ← (cmp[j] ∧ eq[j+i]) ⊕ cmp[j+i]
+  - j>0 组：eq[j] ← eq[j] ∧ eq[j+i]；
+            cmp[j] ← (cmp[j] ∧ eq[j+i]) ⊕ cmp[j+i]
+  不变式：cmp[j] = 1{该段 a > 该段 b}，eq[j] = 1{该段相等}；
+  最终 cmp[0] = 1{a>b}。
+  门数（D=16）：15+7+3+1 = **26 AND/比较**（`lss_and_gates_per_compare`，
+  与设计文档 §3.3 的 26 triple 一致）。
+
+key/通信/轮次（每次比较，D=16）：key = 16 OT16 + 26 BIT_TRIPLE；
+通信 = sender→receiver 16×32 bit（OT 回复）+ 26×2 bit（AND open），
+receiver→sender 16×4 bit（δ）+ 26×2 bit；轮次 = 1 + 4 = **5**。
+
+## 6. MSB / DReLU（wrap 推导）
+
+x = x0 + x1 mod 2^bw。写 x_i = m_i·2^(bw−1) + b_i（m_i = msb(x_i)，
+b_i = 低 bw−1 位）。设 c = 1{b0 + b1 ≥ 2^(bw−1)}（低位相加的进位），则
+
+    x mod 2^bw = ((m0 + m1 + c) mod 2)·2^(bw−1) + (b0 + b1 mod 2^(bw−1))
+    ⟹  msb(x) = m0 ⊕ m1 ⊕ c
+
+c 由比较得到：c = 1{b0 ≥ 2^(bw−1) − b1} = 1{b0 > (2^(bw−1)−1) − b1}。
+即：party1 本地计算 v1 = (2^(bw−1)−1) − b1（mod 2^(bw−1)），双方做
+(bw−1)-bit compare_gt(b0, v1)，各方再本地 XOR 上自己 share 的 msb。
+（与 SCI `AuxProtocols::MSB`，aux-protocols.cpp:175-198 完全一致。）
+
+DReLU(x) = 1{x ≥ 0} = ¬msb(x)：布尔份额本地取反（仅 party0 翻转），
+零通信零轮次。
+
+## 7. ReLU
+
+ReLU(x) = MUX(DReLU(x), x)：x ≥ 0（有符号）输出 x，否则输出 0。
+= MSB（内含 1 次 63-bit 比较）+ 本地取反 + 1 次 MUX。
+
+**每元素核算（bw=64，16 OT16 + 26 triple + 1 MUX，实测与理论一致）**：
+
+| 项 | party0（OT sender） | party1（OT receiver） |
+|---|---|---|
+| key/元素 | 16×35 + 26×6 + 196 bit = **114.0 B** | 16×9 + 26×6 + 196 bit = **62.0 B** |
+| 在线通信/元素 | 发送 70.5 B（不含结果 open） | 发送 14.5 B |
+| 轮次 | 6（叶子 OT 1 + AND 树 4 + MUX 1） | 同左 |
+
+⚠️ key 显式存储未达设计文档 §6 的 ~16–20 B/元素目标：OT16 pad（70 B）
+与 MUX 的 b/c 份额（16 B）均为 dealer PRG 输出，可种子化压缩
+（设计文档 Phase 2 的 PRF 压缩项）；显式残量 ≈ 22 B。
+
 ## key 文件格式 v1（`lss_keys_party{0,1}.bin`）
 
 - 与 FSS key 文件**分离**（P3 再决定是否合并）。两侧记录严格同序。
@@ -101,6 +168,11 @@ Dealer：采样 r ← {0,1}；发双方 r 的布尔份额 rb_i（1 bit）和算�
   - B2A_CORR：rb(1) + ra(64) → 68 bit = 8.5 B
 - Trailer（24 B，字节对齐）：num_records u64 | payload_bytes u64 |
   checksum u64（payload 字节的 FNV-1a 64）。
+
+算子级 key 序列（`gen_compare` / `gen_relu`，顺序 = 在线消费顺序）：
+- compare(bitlength)：先 n×D 条 OT16（叶子一批消费），再 n×gates 条
+  BIT_TRIPLE（AND 树逐层消费）；
+- relu(bw)：compare(bw−1) 的记录 + n 条 MUX_TRIPLE。
 
 ## PRG 说明
 

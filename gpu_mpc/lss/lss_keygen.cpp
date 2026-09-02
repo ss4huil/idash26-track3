@@ -100,6 +100,20 @@ void LssKeygen::gen_b2a(uint64_t count) {
     nrecs_ += count;
 }
 
+// ── 算子级入口（P2）────────────────────────────────────────────────
+void LssKeygen::gen_compare(uint64_t count, int bitlength, int sender_party) {
+    if (bitlength < 1 || bitlength > 64)
+        throw std::runtime_error("lss: gen_compare bitlength 须在 [1,64]");
+    int D = lss_num_digits(bitlength);
+    gen_ot16(count * (uint64_t)D, sender_party);
+    gen_bit_triples(count * lss_and_gates_per_compare(D));
+}
+
+void LssKeygen::gen_relu(uint64_t count, int bw, int sender_party) {
+    gen_compare(count, bw - 1, sender_party);
+    gen_mux(count);
+}
+
 void LssKeygen::write_files(const std::string &path0, const std::string &path1) const {
     for (int p = 0; p < 2; p++) {
         const std::string &path = (p == 0 ? path0 : path1);

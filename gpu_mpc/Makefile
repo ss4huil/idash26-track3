@@ -103,15 +103,17 @@ deepdtagen_inference: deepdtagen_inference.cu deepdtagen.h gcn_layer.h masked_ma
 clean:
 	rm -f $(HERE)/deepdtagen_inference $(HERE)/pool_override.o
 
-# ── LSS (v2 Phase 1): CPU-only dealer keygen + online primitives ─────────────
+# ── LSS (v2 Phase 1+2): CPU-only dealer keygen + online primitives ───────────
 # 纯 CPU，g++ -O2 即可，无需 nvcc/CUDA。协议定义见 lss/lss_protocol.md。
 LSS_DIR := $(HERE)/lss
 
 lss_test: $(LSS_DIR)/lss_test.cpp $(LSS_DIR)/lss_keygen.cpp $(LSS_DIR)/lss_online.cpp \
+          $(LSS_DIR)/lss_compare.cpp \
           $(LSS_DIR)/lss_keys.h $(LSS_DIR)/lss_keygen.h $(LSS_DIR)/lss_online.h \
           $(LSS_DIR)/lss_channel.h
 	g++ -O2 -std=c++17 -Wall -Wextra -I$(LSS_DIR) \
 	    $(LSS_DIR)/lss_test.cpp $(LSS_DIR)/lss_keygen.cpp $(LSS_DIR)/lss_online.cpp \
+	    $(LSS_DIR)/lss_compare.cpp \
 	    -o $(LSS_DIR)/lss_test
 
 lss_test_run: lss_test

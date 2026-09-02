@@ -37,10 +37,21 @@ public:
     // B2A 相关性：r ← {0,1}，双方得 r 的布尔份额 + 算术份额。
     void gen_b2a(uint64_t count);
 
+    // ── 算子级入口（P2）：记录顺序 = 在线消费顺序，严格同序 ──────────
+    // 一次 bitlength 位 Millionaires 比较（1{x>y} 布尔份额）所需记录：
+    //   count×num_digits 条 OT16（叶子一批）+ count×and_gates 条 BIT_TRIPLE
+    //   （AND 树逐层消费；两者内部均按记录流顺序，与在线游标一致）。
+    void gen_compare(uint64_t count, int bitlength, int sender_party = 0);
+
+    // 一次 bw 位 ReLU（MSB(63-bit 比较) + MUX）所需记录：
+    //   gen_compare(count, bw−1) + count 条 MUX_TRIPLE。
+    void gen_relu(uint64_t count, int bw = 64, int sender_party = 0);
+
     // 写出双份 key 文件（含 header/trailer 校验）。
     void write_files(const std::string &path0, const std::string &path1) const;
 
     uint64_t num_records() const { return nrecs_; }
+    uint64_t payload_bits(int party) const { return w_[party].nbits; }
 
 private:
     std::mt19937_64 rng_;
