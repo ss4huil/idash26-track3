@@ -31,19 +31,25 @@
 // The EzPC/GPU-MPC checkout is used strictly read-only (headers + util TUs).
 //
 #include <cassert>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <atomic>
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <omp.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 #include "ddg_orca.h"  // Forked Orca backend with mul/scalarmul for graph models
 #include "ddg_orca_batched.h"  // Optimized backend with LocalARS truncation
 #include "deepdtagen.h"
+#include "secure_adj_norm.h"  // LUT-based online adjacency normalization (DDG_SECURE_ADJ_NORM)
 
 #ifndef InfType
 #define InfType u64
@@ -58,6 +64,36 @@ static void loadShare(const std::string &path, Tensor<InfType> &t)
     assert(f.good() && "missing share file");
     f.read((char *)t.data, t.size() * sizeof(InfType));
     assert(f.gcount() == (std::streamsize)(t.size() * sizeof(InfType)));
+}
+
+// Load chunk `chunk` of a sample-major multi-chunk share file (DDG_NUM_CHUNKS
+// mode): the file holds NC consecutive per-chunk tensors of identical shape,
+// so chunk ck starts at byte offset ck * (per-chunk bytes). `t` is exactly one
+// chunk's tensor (BATCH = per-chunk batch).
+// Zero-padding: when N is not divisible by NC*BATCH the file holds fewer than
+// NC*BATCH samples, so the last chunk can be short (or even absent). Read
+// what exists and zero-fill the rest — an all-zero sample (x/adj/mask = 0;
+// degree 0 → LUT[0]=0) is protocol-safe and its output is discarded.
+static void loadShareSlice(const std::string &path, Tensor<InfType> &t, int chunk)
+{
+    const size_t bytes = t.size() * sizeof(InfType);
+    int fd = open(path.c_str(), O_RDONLY);
+    assert(fd >= 0 && "missing share file");
+    const off_t fsize = lseek(fd, 0, SEEK_END);
+    assert(fsize >= 0 && "stat share file");
+    const off_t start = (off_t)chunk * (off_t)bytes;
+    const size_t avail = (start < fsize)
+        ? std::min<size_t>(bytes, (size_t)(fsize - start)) : 0;
+    size_t done = 0;
+    while (done < avail)
+    {
+        ssize_t r = pread(fd, (char *)t.data + done, avail - done, start + (off_t)done);
+        assert(r > 0 && "pread share slice");
+        done += (size_t)r;
+    }
+    if (avail < bytes)   // zero-pad the missing tail samples of the last chunk
+        memset((char *)t.data + avail, 0, bytes - avail);
+    close(fd);
 }
 
 // ── int64 weight loader ────────────────────────────────────────────────────
@@ -159,6 +195,14 @@ int main(int argc, char *argv[])
     assert(scale < (u64)bw);
     assert(BATCH > 0 && BATCH <= 128);
 
+    // Multi-chunk streaming (key total >> RAM/VRAM): the key file is
+    // NUM_CHUNKS concatenated fixed-size chunks, one per forward of BATCH
+    // samples. NC==1 (default) keeps the original whole-file behavior.
+    int NUM_CHUNKS = 1;
+    if (const char *e = std::getenv("DDG_NUM_CHUNKS"))
+        NUM_CHUNKS = atoi(e);
+    assert(NUM_CHUNKS >= 1);
+
     const u64 Nmax = DDG_NMAX, FEAT = DDG_FEAT;
 
     auto model = new DeepDTAGenAffinity<InfType>();
@@ -252,6 +296,8 @@ int main(int argc, char *argv[])
         model->setBackend(fss);
         model->optimize();
 
+        if (NUM_CHUNKS <= 1)
+        {
         // ORCA SMALL-MASK SCHEME (solves large-mask truncation precision loss).
         // The mask r_X is share0 (the pad from offline split_shares). To avoid
         // FSS truncation errors from wrap-around at the 2^31 sign boundary, the
@@ -275,12 +321,109 @@ int main(int argc, char *argv[])
         maskTiled.d_data = (InfType *)moveToGPU((u8 *)maskTiled.data, maskTiled.size() * sizeof(InfType), nullptr);
         proteinEmb.d_data = (InfType *)moveToGPU((u8 *)proteinEmb.data, proteinEmb.size() * sizeof(InfType), nullptr);
 
+        // ── Secure adjacency normalization keygen (iDASH compliance path) ────
+        // When DDG_SECURE_ADJ_NORM is set, adj_share0 holds the share0 mask of
+        // the RAW 0/1 adjacency (scale 0, self loops included). This emits
+        // [degree-mask shares][DPF-LUT key][mul1 key][mul2 key] into keyBuf
+        // ahead of the graph keys and returns the preprocessing mask of
+        // A_norm, which the GCN keygen below then consumes as A_hat's mask.
+        // Legacy path (env unset): adj shares are the pre-normalized A_hat.
+        InfType *d_A_norm_mask = nullptr;
+        if (std::getenv("DDG_SECURE_ADJ_NORM")) {
+            d_A_norm_mask = ddgSecureAdjNormKeygen<InfType>(
+                &fss->keyBuf, party, bw, (int)scale, &fss->g,
+                A_hat.d_data, BATCH, (int)Nmax);
+            A_hat.d_data = d_A_norm_mask;
+        }
+
         auto &out = model->forward(X);
         fss->output(out);
         fss->close();
+
+        if (d_A_norm_mask != nullptr) {
+            gpuFree(d_A_norm_mask);
+        }
+        }
+        else
+        {
+        // ── Multi-chunk dealer (DDG_NUM_CHUNKS > 1) ─────────────────────────
+        // Each chunk's keys are generated independently (keyBuf rewound to
+        // startPtr per chunk) and appended to the key file at offset
+        // ck * chunkKeySize. Key size is deterministic for fixed
+        // (bw, scale, BATCH, model), so all chunks have the same padded size —
+        // asserted below. Share files are sample-major over NC*BATCH samples.
+        const std::string keyPath = keyFileName + "_inference_key" + std::to_string(party) + ".dat";
+        int kfd = openForWriting(keyPath);
+        size_t chunkKeySize = 0;
+        // proteinEmb keygen mask is 0 for both parties — upload zeros once.
+        proteinEmb.d_data = (InfType *)moveToGPU((u8 *)proteinEmb.data, proteinEmb.size() * sizeof(InfType), nullptr);
+
+        for (int ck = 0; ck < NUM_CHUNKS; ck++)
+        {
+            fss->keyBuf = fss->startPtr;   // rewind key cursor for this chunk
+
+            loadShareSlice(shareDir + "/x_share0.dat", X, ck);
+            loadShareSlice(shareDir + "/adj_share0.dat", A_hat, ck);
+            loadShareSlice(shareDir + "/mask_share0.dat", maskTiled, ck);
+
+            X.d_data         = (InfType *)moveToGPU((u8 *)X.data, X.size() * sizeof(InfType), nullptr);
+            A_hat.d_data     = (InfType *)moveToGPU((u8 *)A_hat.data, A_hat.size() * sizeof(InfType), nullptr);
+            maskTiled.d_data = (InfType *)moveToGPU((u8 *)maskTiled.data, maskTiled.size() * sizeof(InfType), nullptr);
+            InfType *d_A_raw = A_hat.d_data;
+
+            // Same LUT keygen hook as the single-chunk path (see above).
+            InfType *d_A_norm_mask = nullptr;
+            if (std::getenv("DDG_SECURE_ADJ_NORM")) {
+                d_A_norm_mask = ddgSecureAdjNormKeygen<InfType>(
+                    &fss->keyBuf, party, bw, (int)scale, &fss->g,
+                    A_hat.d_data, BATCH, (int)Nmax);
+                A_hat.d_data = d_A_norm_mask;
+            }
+
+            auto &out = model->forward(X);
+            fss->output(out);
+
+            // Pad to 4 KiB (same as DDGOrcaBaseKeygen::close) and pwrite.
+            size_t rawBytes = (size_t)(fss->keyBuf - fss->startPtr);
+            size_t padded   = (rawBytes + 4095) / 4096 * 4096;
+            memset(fss->keyBuf, 0, padded - rawBytes);
+            if (ck == 0)
+                chunkKeySize = padded;
+            else
+                assert(padded == chunkKeySize && "chunk key size drifted — keygen must be size-deterministic");
+            size_t done = 0;
+            while (done < chunkKeySize)
+            {
+                ssize_t w = pwrite(kfd, fss->startPtr + done, chunkKeySize - done,
+                                   (off_t)ck * (off_t)chunkKeySize + (off_t)done);
+                assert(w > 0 && "pwrite key chunk");
+                done += (size_t)w;
+            }
+
+            gpuFree(X.d_data);
+            gpuFree(d_A_raw);
+            gpuFree(maskTiled.d_data);
+            if (d_A_norm_mask != nullptr)
+                gpuFree(d_A_norm_mask);
+            printf("[chunked-dealer] party%d chunk %d/%d: %.1f MiB\n",
+                   party, ck + 1, NUM_CHUNKS, chunkKeySize / 1048576.0);
+        }
+        assert(0 == fsync(kfd) && "sync error");
+        closeFile(kfd);
+        printf("[chunked-dealer] party%d wrote %d chunks x %.1f MiB to %s\n",
+               party, NUM_CHUNKS, chunkKeySize / 1048576.0, keyPath.c_str());
+        // close() minus the whole-buffer write (already pwritten per chunk).
+        cpuFree(fss->startPtr, true);
+        destroyGPURandomness();
+        destroyCPURandomness();
+        }
     }
     else
     {
+        auto ip = (argc > 8) ? argv[8] : "127.0.0.1";
+
+        if (NUM_CHUNKS <= 1)
+        {
         // Evaluator: load this party's real secret shares, then run online.
         //  P1 secrets (drug graph): X, A_hat, maskTiled — both parties hold a share.
         loadShare(shareDir + "/x_share"    + std::to_string(party) + ".dat", X);
@@ -290,8 +433,6 @@ int main(int argc, char *argv[])
         //  zero. Load only on party 1; party 0's tensor stays zeroed.
         if (party == 1)
             loadShare(shareDir + "/protein_emb.dat", proteinEmb);
-
-        auto ip = (argc > 8) ? argv[8] : "127.0.0.1";
 
         // Select backend based on optimization flags
         DDGOrcaBase<InfType> *fss = nullptr;
@@ -307,6 +448,9 @@ int main(int argc, char *argv[])
         u64 commBytes = 0;
         lseek(fss->fd, 0, SEEK_SET);
         readKey(fss->fd, fss->keySize, fss->startPtr, NULL);
+        // Bulk-upload the whole key file to GPU once; subsequent per-op key
+        // reads become pointer translations (no H2D, no alloc/free).
+        initGPUKeyArena(fss->startPtr, fss->keySize);
 
         // ── OPTIMIZATION: One-time H2D upload + per-iteration D2D refresh ──────
         // revealIfLeaf mutates GPU data in-place (share → revealed value), so we
@@ -328,6 +472,13 @@ int main(int argc, char *argv[])
         InfType *d_proteinEmb_work = (InfType *)gpuMalloc(proteinEmb.size() * sizeof(InfType));
 
         Tensor<InfType> *out_ptr = nullptr;   // capture last forward output
+
+        // Secure adjacency normalization mode (see secure_adj_norm.h): the
+        // adj share files hold RAW 0/1 adjacency (scale 0) and A_norm is
+        // computed online per iteration; its output is masked-public, so
+        // A_hat must NOT be registered as an unrevealed secret leaf.
+        const bool secureAdjNorm = std::getenv("DDG_SECURE_ADJ_NORM") != nullptr;
+
         for (int i = 0; i < 11; i++)
         {
             fss->keyBuf = fss->startPtr;
@@ -357,7 +508,10 @@ int main(int argc, char *argv[])
             // _MatMul. Register each slice pointer so revealIfLeaf matches.
             if (BATCH == 1) {
                 fss->registerLeaf(X.d_data);
-                fss->registerLeaf(A_hat.d_data);
+                // LUT mode: A_norm comes out of ddgSecureAdjNormEval already
+                // masked-public — registering it would double-reveal.
+                if (!secureAdjNorm)
+                    fss->registerLeaf(A_hat.d_data);
                 fss->registerLeaf(maskTiled.d_data);
                 fss->registerLeaf(proteinEmb.d_data);
             } else {
@@ -367,8 +521,10 @@ int main(int argc, char *argv[])
                 }
 
                 // A_hat: register each (Nmax×Nmax) slice for batched _MatMul reveal.
-                for (int b = 0; b < BATCH; ++b) {
-                    fss->registerLeaf(A_hat.d_data + b * Nmax * Nmax);
+                if (!secureAdjNorm) {
+                    for (int b = 0; b < BATCH; ++b) {
+                        fss->registerLeaf(A_hat.d_data + b * Nmax * Nmax);
+                    }
                 }
 
                 // maskTiled: register full folded pointer (pool uses full tensor).
@@ -378,9 +534,28 @@ int main(int argc, char *argv[])
                 fss->registerLeaf(proteinEmb.d_data);
             }
 
+            // ── Secure online adjacency normalization (inside timed region) ──
+            // Input:  d_A_hat_work holds this party's RAW adjacency share
+            //         (scale 0). The eval mutates it in place (masked-public
+            //         reveal of A_raw) — safe because the work buffer is
+            //         refreshed D2D from pristine at the top of each iter.
+            // Output: masked-public A_norm at Q(scale), consumed directly by
+            //         the GCN _MatMul (no leaf reveal).
+            InfType *d_A_norm = nullptr;
+            if (secureAdjNorm) {
+                d_A_norm = ddgSecureAdjNormEval<InfType>(
+                    &fss->keyBuf, fss->peer, party, bw, (int)scale,
+                    &fss->g, &fss->s, d_A_hat_work, BATCH, (int)Nmax);
+                A_hat.d_data = d_A_norm;
+            }
+
             auto &out = model->forward(X);
             fss->output(out);
             out_ptr = &out;   // model holds this tensor; stable across iters
+
+            if (d_A_norm != nullptr) {
+                gpuFree(d_A_norm);
+            }
             auto end = std::chrono::high_resolution_clock::now();
             if (i > 0)
                 times.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
@@ -434,6 +609,263 @@ int main(int argc, char *argv[])
                 else
                     printf("AFFINITY[%d]=%.6f\n", j, aff);
             }
+        }
+        }
+        else
+        {
+        // ── Multi-chunk streaming eval (DDG_NUM_CHUNKS > 1) ─────────────────
+        // Key file = NC concatenated fixed-size chunks (one forward of BATCH
+        // samples per chunk). Three-stage pipeline with double buffering —
+        // slot k%2 holds chunk k:
+        //
+        //   I/O thread : SSD --pread--> pinned host slot --memcpyAsync--> VRAM slot
+        //   compute    : wait evH2D[slot] -> setGPUKeyArenaSlot -> forward once
+        //
+        // Steady-state chunk time = max(compute, PCIe H2D, SSD read) instead of
+        // their sum. DDG_PREFETCH=0 disables the I/O thread (synchronous load;
+        // control group where stall = full pread+H2D time).
+        const bool secureAdjNorm = std::getenv("DDG_SECURE_ADJ_NORM") != nullptr;
+        const bool prefetch = [] {
+            const char *e = std::getenv("DDG_PREFETCH");
+            return !(e && e[0] == '0');
+        }();
+        // bw=64 key streams are not 8B-alignment-safe for the zero-copy arena
+        // (packed bit sections leave 4-mod-8 offsets). With DDG_KEY_ARENA=0 the
+        // pipeline keeps SSD->pinned-RAM prefetch but skips the VRAM slots and
+        // the arena binding; per-op moveToGPU then copies from pinned memory
+        // (cheap vs the SSD-bound chunk time at bw=64).
+        const bool arenaOff = [] {
+            const char *e = std::getenv("DDG_KEY_ARENA");
+            return e && e[0] == '0';
+        }();
+
+        // Select backend based on optimization flags (same as NC==1).
+        DDGOrcaBase<InfType> *fss = nullptr;
+        if (std::getenv("DDG_SLACK_TRUNC") || std::getenv("DDG_LOCAL_TRUNC")) {
+            fss = new DDGOrcaBatched<InfType>(party, ip, bw, (int)scale, keyFileName);
+        } else {
+            fss = new DDGOrca<InfType>(party, ip, bw, (int)scale, keyFileName);
+        }
+        model->setBackend(fss);
+        model->optimize();
+
+        // In chunked mode the backend constructor skipped the whole-file host
+        // buffer (DDG_NUM_CHUNKS>1) — fss->fd/keySize refer to the key file.
+        assert(fss->keySize % (size_t)NUM_CHUNKS == 0 && "key file size not divisible by DDG_NUM_CHUNKS");
+        const size_t chunkKeySize = fss->keySize / NUM_CHUNKS;
+        printf("[chunked-eval] party%d: keys %.1f MiB = %d chunks x %.1f MiB, prefetch=%d\n",
+               party, fss->keySize / 1048576.0, NUM_CHUNKS, chunkKeySize / 1048576.0, (int)prefetch);
+
+        // Double buffers: 2 pinned host slots (+ 2 VRAM slots unless arenaOff).
+        u8 *h_slot[2], *d_slot[2] = {nullptr, nullptr};
+        for (int s = 0; s < 2; s++) {
+            checkCudaErrors(cudaHostAlloc((void **)&h_slot[s], chunkKeySize, cudaHostAllocDefault));
+            if (!arenaOff)
+                checkCudaErrors(cudaMalloc((void **)&d_slot[s], chunkKeySize));
+            if (std::getenv("DDG_DEBUG_XFER"))
+                fprintf(stderr, "[slot %d] h=%p d=%p size=%zu (d range ends %p)\n",
+                        s, (void *)h_slot[s], (void *)d_slot[s], chunkKeySize,
+                        (void *)(d_slot[s] + chunkKeySize));
+        }
+        cudaStream_t copyStream;
+        checkCudaErrors(cudaStreamCreateWithFlags(&copyStream, cudaStreamNonBlocking));
+        cudaEvent_t evH2D[2], evFree[2];
+        for (int s = 0; s < 2; s++) {
+            checkCudaErrors(cudaEventCreateWithFlags(&evH2D[s], cudaEventDisableTiming));
+            checkCudaErrors(cudaEventCreateWithFlags(&evFree[s], cudaEventDisableTiming));
+        }
+
+        auto preadChunk = [&](int ck, u8 *dst) {
+            size_t off = 0;
+            while (off < chunkKeySize) {
+                ssize_t r = pread(fss->fd, dst + off, chunkKeySize - off,
+                                  (off_t)ck * (off_t)chunkKeySize + (off_t)off);
+                assert(r > 0 && "pread key chunk");
+                off += (size_t)r;
+            }
+        };
+
+        // I/O thread: preload chunk ck into slot ck%2. Before reusing a slot
+        // (ck >= 2): host side waits until chunk ck-2's compute recorded
+        // evFree (computeDone handshake) and its H2D completed (evH2D — pinned
+        // buffer reusable); the copy stream waits evFree so the new H2D cannot
+        // overwrite the VRAM slot before chunk ck-2's kernels finished.
+        std::atomic<int> computeDone{-1};
+        // Highest chunk whose H2D has been RECORDED on copyStream. The compute
+        // thread must spin on this before cudaEventSynchronize(evH2D[slot]):
+        // synchronizing an event that was never recorded returns immediately,
+        // which would let compute read a VRAM/pinned slot mid-fill (race seen
+        // as garbage keys at chunk 0/1: wrong affinities or huge-N comm asserts).
+        std::atomic<int> h2dRecorded{-1};
+        std::atomic<int> hReady{-1};   // debug (DDG_IO_PREAD_ONLY): highest chunk pread-complete
+        const bool ioPreadOnly = std::getenv("DDG_IO_PREAD_ONLY") != nullptr;
+        std::thread ioThread;
+        if (prefetch) {
+            ioThread = std::thread([&]() {
+                for (int ck = 0; ck < NUM_CHUNKS; ck++) {
+                    int s = ck & 1;
+                    if (ck >= 2) {
+                        while (computeDone.load(std::memory_order_acquire) < ck - 2)
+                            std::this_thread::yield();
+                        if (!ioPreadOnly && !arenaOff) {
+                            checkCudaErrors(cudaEventSynchronize(evH2D[s]));
+                            checkCudaErrors(cudaStreamWaitEvent(copyStream, evFree[s], 0));
+                        }
+                    }
+                    preadChunk(ck, h_slot[s]);
+                    if (ioPreadOnly) {
+                        hReady.store(ck, std::memory_order_release);
+                    } else if (arenaOff) {
+                        h2dRecorded.store(ck, std::memory_order_release);  // pinned slot ready (no H2D)
+                    } else {
+                        checkCudaErrors(cudaMemcpyAsync(d_slot[s], h_slot[s], chunkKeySize,
+                                                        cudaMemcpyHostToDevice, copyStream));
+                        checkCudaErrors(cudaEventRecord(evH2D[s], copyStream));
+                        h2dRecorded.store(ck, std::memory_order_release);
+                    }
+                }
+            });
+        }
+
+        // Per-chunk working buffers for input shares (reused every chunk).
+        InfType *d_X_work          = (InfType *)gpuMalloc(X.size()          * sizeof(InfType));
+        InfType *d_A_hat_work      = (InfType *)gpuMalloc(A_hat.size()      * sizeof(InfType));
+        InfType *d_maskTiled_work  = (InfType *)gpuMalloc(maskTiled.size()  * sizeof(InfType));
+        InfType *d_proteinEmb_work = (InfType *)gpuMalloc(proteinEmb.size() * sizeof(InfType));
+
+        std::vector<InfType> affOut;   // party 0 collects one BATCH-vector per chunk
+        u64 totalComputeUs = 0, totalStallUs = 0;
+        auto commStartAll = fss->peer->bytesSent() + fss->peer->bytesReceived();
+        auto wallStart = std::chrono::high_resolution_clock::now();
+
+        for (int ck = 0; ck < NUM_CHUNKS; ck++)
+        {
+            int s = ck & 1;
+            auto stallStart = std::chrono::high_resolution_clock::now();
+            if (prefetch) {
+                while (h2dRecorded.load(std::memory_order_acquire) < ck)
+                    std::this_thread::yield();                   // event recorded?
+                if (!arenaOff)
+                    checkCudaErrors(cudaEventSynchronize(evH2D[s]));   // wait chunk keys resident
+            } else {
+                preadChunk(ck, h_slot[s]);                         // synchronous control path
+                if (!arenaOff)
+                    checkCudaErrors(cudaMemcpy(d_slot[s], h_slot[s], chunkKeySize, cudaMemcpyHostToDevice));
+            }
+            auto stallEnd = std::chrono::high_resolution_clock::now();
+            u64 stallUs = std::chrono::duration_cast<std::chrono::microseconds>(stallEnd - stallStart).count();
+            totalStallUs += stallUs;
+
+            // Bind the arena to this chunk's slot: all key reads (moveToGPU
+            // pointer translation) now resolve into d_slot[s]. arenaOff: key
+            // reads fall back to per-op cudaMemcpy from the pinned slot.
+            if (!arenaOff)
+                setGPUKeyArenaSlot(h_slot[s], d_slot[s], chunkKeySize);
+            fss->keyBuf = h_slot[s];
+            fss->s.reset();
+            fss->sxsMatmulIdx = 0;
+            fss->resetLeaves();
+
+            // Per-chunk share slices (synchronous; ~MB, negligible vs GB keys).
+            loadShareSlice(shareDir + "/x_share"    + std::to_string(party) + ".dat", X, ck);
+            loadShareSlice(shareDir + "/adj_share"  + std::to_string(party) + ".dat", A_hat, ck);
+            loadShareSlice(shareDir + "/mask_share" + std::to_string(party) + ".dat", maskTiled, ck);
+            if (party == 1)
+                loadShareSlice(shareDir + "/protein_emb.dat", proteinEmb, ck);
+            checkCudaErrors(cudaMemcpy(d_X_work,          X.data,          X.size()          * sizeof(InfType), cudaMemcpyHostToDevice));
+            checkCudaErrors(cudaMemcpy(d_A_hat_work,      A_hat.data,      A_hat.size()      * sizeof(InfType), cudaMemcpyHostToDevice));
+            checkCudaErrors(cudaMemcpy(d_maskTiled_work,  maskTiled.data,  maskTiled.size()  * sizeof(InfType), cudaMemcpyHostToDevice));
+            checkCudaErrors(cudaMemcpy(d_proteinEmb_work, proteinEmb.data, proteinEmb.size() * sizeof(InfType), cudaMemcpyHostToDevice));
+
+            X.d_data          = d_X_work;
+            A_hat.d_data      = d_A_hat_work;
+            maskTiled.d_data  = d_maskTiled_work;
+            proteinEmb.d_data = d_proteinEmb_work;
+
+            fss->peer->sync();
+            auto computeStart = std::chrono::high_resolution_clock::now();
+
+            // Register secret leaves (same policy as NC==1; A_hat skipped in
+            // LUT mode — ddgSecureAdjNormEval output is already masked-public).
+            if (BATCH == 1) {
+                fss->registerLeaf(X.d_data);
+                if (!secureAdjNorm)
+                    fss->registerLeaf(A_hat.d_data);
+                fss->registerLeaf(maskTiled.d_data);
+                fss->registerLeaf(proteinEmb.d_data);
+            } else {
+                for (int b = 0; b < BATCH; ++b)
+                    fss->registerLeaf(X.d_data + b * Nmax * FEAT);
+                if (!secureAdjNorm) {
+                    for (int b = 0; b < BATCH; ++b)
+                        fss->registerLeaf(A_hat.d_data + b * Nmax * Nmax);
+                }
+                fss->registerLeaf(maskTiled.d_data);
+                fss->registerLeaf(proteinEmb.d_data);
+            }
+
+            // LUT online adjacency normalization on this chunk's raw-A share
+            // (mutates d_A_hat_work in place; refreshed from host next chunk).
+            InfType *d_A_norm = nullptr;
+            if (secureAdjNorm) {
+                d_A_norm = ddgSecureAdjNormEval<InfType>(
+                    &fss->keyBuf, fss->peer, party, bw, (int)scale,
+                    &fss->g, &fss->s, d_A_hat_work, BATCH, (int)Nmax);
+                A_hat.d_data = d_A_norm;
+            }
+
+            auto &out = model->forward(X);
+            fss->output(out);
+            if (d_A_norm != nullptr)
+                gpuFree(d_A_norm);
+
+            auto computeEnd = std::chrono::high_resolution_clock::now();
+            u64 compUs = std::chrono::duration_cast<std::chrono::microseconds>(computeEnd - computeStart).count();
+            totalComputeUs += compUs;
+            // VRAM slot stays live until this chunk's compute + output D2H
+            // (all on stream 0) complete; then the I/O thread may refill it.
+            checkCudaErrors(cudaEventRecord(evFree[s], 0));
+            computeDone.store(ck, std::memory_order_release);
+
+            printf("[chunk %d/%d] compute=%lu us stall=%lu us\n", ck, NUM_CHUNKS, compUs, stallUs);
+
+            if (party == 0) {
+                for (int j = 0; j < (int)out.size(); j++)
+                    affOut.push_back(out.data[j]);
+            }
+        }
+
+        auto wallEnd = std::chrono::high_resolution_clock::now();
+        if (prefetch)
+            ioThread.join();
+        u64 wallUs = std::chrono::duration_cast<std::chrono::microseconds>(wallEnd - wallStart).count();
+        auto commEndAll = fss->peer->bytesSent() + fss->peer->bytesReceived();
+        printf("Average time taken (microseconds)=%f\n", (double)totalComputeUs / NUM_CHUNKS);
+        printf("Comm (B)=%lu\n", commEndAll - commStartAll);
+        printf("[chunked-eval] wall=%lu us sumCompute=%lu us sumStall=%lu us\n",
+               wallUs, totalComputeUs, totalStallUs);
+
+        for (int s = 0; s < 2; s++) {
+            checkCudaErrors(cudaFreeHost(h_slot[s]));
+            checkCudaErrors(cudaFree(d_slot[s]));
+            checkCudaErrors(cudaEventDestroy(evH2D[s]));
+            checkCudaErrors(cudaEventDestroy(evFree[s]));
+        }
+        checkCudaErrors(cudaStreamDestroy(copyStream));
+        gpuFree(d_X_work);
+        gpuFree(d_A_hat_work);
+        gpuFree(d_maskTiled_work);
+        gpuFree(d_proteinEmb_work);
+
+        fss->close();
+
+        if (party == 0) {
+            for (int j = 0; j < (int)affOut.size(); j++) {
+                int32_t sv = (int32_t)(uint32_t)(uint64_t)affOut[j];
+                double  aff = (double)sv / (double)(1LL << scale);
+                printf("AFFINITY[%d]=%.6f\n", j, aff);
+            }
+        }
         }
     }
     return 0;

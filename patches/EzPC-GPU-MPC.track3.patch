@@ -1,0 +1,813 @@
+diff --git a/GPU-MPC/ext/sytorch/include/sytorch/backend/backend.h b/GPU-MPC/ext/sytorch/include/sytorch/backend/backend.h
+index 264543c..6972067 100644
+--- a/GPU-MPC/ext/sytorch/include/sytorch/backend/backend.h
++++ b/GPU-MPC/ext/sytorch/include/sytorch/backend/backend.h
+@@ -148,6 +148,9 @@ public:
+     // add API
+     virtual void add(const std::vector<Tensor<T> *> &in, Tensor<T> &out) NOT_IMPLEMENTED;
+ 
++    // sub API: out = b - a (pure ring subtraction, no truncation)
++    virtual void sub(Tensor<T> &b, Tensor<T> &a, Tensor<T> &out) NOT_IMPLEMENTED;
++
+     // softmax API
+     virtual void softmaxGrad(Tensor<T> &in) NOT_IMPLEMENTED;
+ 
+diff --git a/GPU-MPC/ext/sytorch/include/sytorch/module.h b/GPU-MPC/ext/sytorch/include/sytorch/module.h
+index 39a69b4..7d58d60 100644
+--- a/GPU-MPC/ext/sytorch/include/sytorch/module.h
++++ b/GPU-MPC/ext/sytorch/include/sytorch/module.h
+@@ -41,7 +41,7 @@ public:
+     u64 scale;
+ 
+     std::vector<LayerGraphNode<T> *> allNodesInExecutionOrder;
+-    const std::vector<std::string> functionalLayers = {"Add", "Concat", "GeLU", "SoftMax", "Split", "View", "Transpose", "_MatMul", "_ScalarMul", "ReLU", "AttentionMask", "LocalAttentionMask", "_Tanh", "Unsqueeze", "SoftMaxTriangular", "_MatMulTriangular", "AttentionTriangular", "_Mul", "SiLU", "_ScalarDiv", "RotaryEmbedding"};
++    const std::vector<std::string> functionalLayers = {"Add", "Concat", "GeLU", "SoftMax", "Split", "View", "Transpose", "_MatMul", "_ScalarMul", "ReLU", "AttentionMask", "LocalAttentionMask", "_Tanh", "Unsqueeze", "SoftMaxTriangular", "_MatMulTriangular", "AttentionTriangular", "_Mul", "_Sub", "SiLU", "_ScalarDiv", "RotaryEmbedding"};
+     static std::map<std::string, LayerGraphNode<T> *> functionalLayerMap;
+ 
+ public:
+@@ -627,6 +627,22 @@ public:
+         return c;
+     }
+ 
++    // sub(a, b) computes a - b via the _Sub functional layer (pure ring op,
++    // no truncation). Requires a layers/layers.h that defines _Sub.
++    Tensor<T> &sub(Tensor<T> &a, Tensor<T> &b)
++    {
++        if (a.graphGenMode)
++        {
++            auto &c = functionalGraphGen<_Sub<T>>({&a, &b});
++            return c;
++        }
++
++        auto cNode = getFunctionalNode("_Sub", {&a, &b});
++        std::vector<Tensor<T> *> arr = {&a, &b};
++        auto &c = cNode->layer->forward(arr);
++        return c;
++    }
++
+     Tensor<T> &scalarmul(Tensor<T> &a, double scalar)
+     {
+         if (a.graphGenMode)
+diff --git a/GPU-MPC/fss/dcf/gpu_dcf.cu b/GPU-MPC/fss/dcf/gpu_dcf.cu
+index 34dba98..df5a9bc 100644
+--- a/GPU-MPC/fss/dcf/gpu_dcf.cu
++++ b/GPU-MPC/fss/dcf/gpu_dcf.cu
+@@ -156,7 +156,7 @@ namespace dcf
+ 
+         doDcf<T, E, pr, ep><<<num_thread_blocks, tb_size>>>(k.bin, k.bout, party, k.N, d_in, d_scw, d_vcw, d_l, d_out, oStride, *g);
+ 
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         gpuFree(d_scw);
+         gpuFree(d_l);
+         gpuFree(d_vcw);
+@@ -333,7 +333,7 @@ namespace dcf
+ 
+         keyGenDCFKernel<<<(N - 1) / 256 + 1, 256>>>(party, bin, bout, N, d_rin,
+                                                     u64(payload), d_s0, d_s1, d_k0, d_v0, d_leaves, *gaes, leq);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+ 
+         moveIntoCPUMem(*key_as_bytes, (u8 *)d_k0, memSzK, NULL);
+         *key_as_bytes += memSzK;
+diff --git a/GPU-MPC/fss/dcf/gpu_maxpool.cu b/GPU-MPC/fss/dcf/gpu_maxpool.cu
+index 7e03625..66c26ff 100644
+--- a/GPU-MPC/fss/dcf/gpu_maxpool.cu
++++ b/GPU-MPC/fss/dcf/gpu_maxpool.cu
+@@ -31,7 +31,7 @@ namespace dcf
+         int outSz = getMSz(p);
+         T *d_diff = (T *)gpuMalloc(outSz * sizeof(T));
+         diffWithCurMax<<<(outSz - 1) / 256 + 1, 256>>>(p, i, j, d_curMax, d_I, d_diff, outSz);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         auto d_res = gpuTwoRoundRelu(peer, party, k, d_diff, gaes, s);
+         auto d_drelu = d_res.first;
+         auto d_newMax = d_res.second;
+@@ -56,7 +56,7 @@ namespace dcf
+         int outSz = getMSz(p);
+         T *d_curMax = (T *)gpuMalloc(outSz * sizeof(T));
+         populateCurMax<<<(outSz - 1) / 256 + 1, 256>>>(p, d_curMax, d_I, outSz);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         for (int i = 0; i < p.FH; i++)
+         {
+             for (int j = 0; j < p.FW; j++)
+@@ -80,7 +80,7 @@ namespace dcf
+         T *d_diffMask = (T *)gpuMalloc(outSz * sizeof(T));
+         // d_diffMask = inputMask - curMask
+         diffWithCurMax<<<(outSz - 1) / 256 + 1, 256>>>(p, fh, fw, d_curMaxMask, d_inputMask, d_diffMask, outSz);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         auto d_res = gpuGenTwoRoundReluKey(key_as_bytes, party, p.bin, p.bw, outSz, d_diffMask, gaes);
+         auto d_dreluMask = d_res.first;
+         auto d_newMaxMask = d_res.second;
+@@ -102,7 +102,7 @@ namespace dcf
+         int outSz = getMSz(p);
+         T *d_curMaxMask = (T *)gpuMalloc(outSz * sizeof(T));
+         populateCurMax<<<(outSz - 1) / 256 + 1, 256>>>(p, d_curMaxMask, d_inputMask, outSz);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         for (int i = 0; i < p.FH; i++)
+         {
+             for (int j = 0; j < p.FW; j++)
+diff --git a/GPU-MPC/fss/dcf/gpu_relu.cu b/GPU-MPC/fss/dcf/gpu_relu.cu
+index 77ea8ec..26f0bc1 100644
+--- a/GPU-MPC/fss/dcf/gpu_relu.cu
++++ b/GPU-MPC/fss/dcf/gpu_relu.cu
+@@ -91,7 +91,7 @@ namespace dcf
+         auto d_oneHot = (T *)moveToGPU((uint8_t *)h_oneHot, 4 * N * sizeof(T), s);
+         auto d_outMask = (T *)moveToGPU((uint8_t *)h_outMask, 2 * N * sizeof(T), s);
+         reluExtendMuxKernel<<<(N - 1) / 128 + 1, 128>>>(party, bin, N, d_I, d_out, d_oneHot, d_outMask, d_drelu, d_xLTRin);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         gpuFree(d_oneHot);
+         gpuFree(d_outMask);
+         return d_out;
+diff --git a/GPU-MPC/fss/dcf/gpu_sgd.cu b/GPU-MPC/fss/dcf/gpu_sgd.cu
+index 5fa2653..859c5d9 100644
+--- a/GPU-MPC/fss/dcf/gpu_sgd.cu
++++ b/GPU-MPC/fss/dcf/gpu_sgd.cu
+@@ -45,7 +45,7 @@ namespace dcf
+     {
+         assert(shift < sizeof(T) * 64);
+         leftShiftAndAddKernel<<<(N - 1) / 128 + 1, 128>>>(d_A, d_B, d_C, shift, alpha, N);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+     }
+ 
+     template <typename T>
+diff --git a/GPU-MPC/fss/dcf/gpu_sstab.h b/GPU-MPC/fss/dcf/gpu_sstab.h
+index c6b8c56..306c7b3 100644
+--- a/GPU-MPC/fss/dcf/gpu_sstab.h
++++ b/GPU-MPC/fss/dcf/gpu_sstab.h
+@@ -60,7 +60,7 @@ namespace dcf
+         // printf("Bin=%d, Memsz=%ld\n", k.bin, k.memSzSS);
+         auto d_ss = (u8 *)moveToGPU((u8 *)k.ss, k.memSzSS, s);
+         dcf::lookupSSTable<T, E, pr, ep><<<(k.N - 1) / 128 + 1, 128>>>(party, k.bin, k.N, d_in, d_ss, d_out);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         gpuFree(d_ss);
+         return d_out;
+     }
+diff --git a/GPU-MPC/fss/dcf/gpu_truncate.cu b/GPU-MPC/fss/dcf/gpu_truncate.cu
+index c929fd0..77363d0 100644
+--- a/GPU-MPC/fss/dcf/gpu_truncate.cu
++++ b/GPU-MPC/fss/dcf/gpu_truncate.cu
+@@ -170,7 +170,7 @@ namespace dcf
+         auto d_outMask = (T *)moveToGPU((u8 *)h_outMask, memSz, s);
+         auto d_p = (T *)moveToGPU((u8 *)h_p, 2 * memSz, s);
+         selectForTruncateKernel<T><<<(N - 1) / 128 + 1, 128>>>(d_I, d_maskedDcfBit, d_outMask, d_p, N, party);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+         gpuFree(d_outMask);
+         gpuFree(d_p);
+     }
+diff --git a/GPU-MPC/fss/gpu_add.h b/GPU-MPC/fss/gpu_add.h
+index a7aa91d..74302cc 100644
+--- a/GPU-MPC/fss/gpu_add.h
++++ b/GPU-MPC/fss/gpu_add.h
+@@ -40,6 +40,6 @@ T* gpuAdd(int bw, int N, std::vector<T*> &h_dPtrsOnHost) {
+     T** d_dPtrs = (T**) moveToGPU((uint8_t*) h_dPtrsOnHost.data(), numDPtrs * sizeof(T*), NULL); 
+     T* d_out = (T*) gpuMalloc(N * sizeof(T)); 
+     addManyArrays<<<(N - 1) / 128 + 1, 128>>>(bw, numDPtrs, N, d_dPtrs, d_out); 
+-    checkCudaErrors(cudaDeviceSynchronize()); 
++    checkCudaErrors(cudaGetLastError()); 
+     return d_out; 
+ }
+diff --git a/GPU-MPC/fss/gpu_avgpool.cu b/GPU-MPC/fss/gpu_avgpool.cu
+index 4c1a004..d04846d 100644
+--- a/GPU-MPC/fss/gpu_avgpool.cu
++++ b/GPU-MPC/fss/gpu_avgpool.cu
+@@ -76,7 +76,7 @@ T *gpuAddPoolBackProp(AvgPoolParams p, T *d_incomingGrad, Stats *s)
+     size_t inSz = p.N * p.imgH * p.imgW * p.C;
+     T c = (T(1) << p.scaleDiv) / T(p.FH * p.FW);
+     gpuLinearComb(p.bw, inSz, d_outgoingGrad, c, d_outgoingGrad);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_outgoingGrad;
+ }
+ 
+@@ -87,6 +87,6 @@ T *gpuAddPool(AvgPoolParams p, T *d_I, Stats *s)
+     int outSz = getMSz(p);
+     T *d_O = (T *)gpuMalloc(outSz * sizeof(T));
+     addPoolKernel<<<(outSz - 1) / 256 + 1, 256>>>(p, d_I, d_O, outSz);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_O;
+ }
+diff --git a/GPU-MPC/fss/gpu_conv2d.cu b/GPU-MPC/fss/gpu_conv2d.cu
+index d69c0d2..db94f8b 100644
+--- a/GPU-MPC/fss/gpu_conv2d.cu
++++ b/GPU-MPC/fss/gpu_conv2d.cu
+@@ -144,7 +144,7 @@ T *cutlass_conv2d(GPUConv2DKey<T> k, T *d_I, T *d_F, T *d_C /*, GPUContext* c*/,
+ 
+     gpuFree(workspace);
+ 
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     // auto end = std::chrono::high_resolution_clock::now();
+     // auto elapsed = end - start;
+     // std::cout << "Time for cutlass conv2d in microseconds: " << std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() << std::endl;
+@@ -344,7 +344,7 @@ T *cutlassConv2D(GPUConv2DKey<T> k, T *d_I, T *d_F, T *d_C, char op, bool cIsBia
+     if (reduceBw && k.p.bout < sizeof(T) * 8)
+     {
+         modKernel<<<(k.p.size_O - 1) / block_size + 1, block_size>>>(k.p.size_O, d_O, k.p.bout);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+     }
+     return d_O;
+ }
+@@ -408,7 +408,7 @@ T *gpuConv2DPlaintext(GPUConv2DKey<T> k, T *d_I, T *d_F, T *d_C, char op, bool c
+     // printf("here\n");
+     auto d_O = cutlassConv2D(k, d_I, d_F, d_C, op, cIsBias, true);
+     // if(k.Bout < sizeof(T) * 8) modKernel<<<(k.size_O - 1) / block_size + 1, block_size>>>(k.size_O, d_O, k.Bout);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_O;
+ }
+ 
+diff --git a/GPU-MPC/fss/gpu_dpf.cu b/GPU-MPC/fss/gpu_dpf.cu
+index 770be6b..66bd63f 100644
+--- a/GPU-MPC/fss/gpu_dpf.cu
++++ b/GPU-MPC/fss/gpu_dpf.cu
+@@ -249,7 +249,7 @@ void gpuDpfTreeEval(GPUDPFTreeKey k, int party, T *d_in, AESGlobalContext *g, St
+     // auto start = std::chrono::high_resolution_clock::now();
+     // kernel launch
+     dpfTreeEval<T, t><<<tb, tbSz>>>(party, k.bin, k.N, d_in, d_scw, d_l0, d_l1, d_tR, d_out, oStride, *g);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     // auto end = std::chrono::high_resolution_clock::now();
+     // auto elapsed = end - start;
+     // printf("Time taken by dpf kernel=%lu micros\n", std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+@@ -398,6 +398,9 @@ void doDpfTreeKeyGen(u8 **key_as_bytes, int party, int bin, int N,
+     writeInt(key_as_bytes, N);
+     writeInt(key_as_bytes, evalAll);
+     assert(bin > LOG_AES_BLOCK_LEN);
++    // pad so AESBlock components land on 16B boundaries (mirrors
++    // readGPUDPFTreeKey; required for GPU-resident keys)
++    *key_as_bytes += (16 - ((uintptr_t)*key_as_bytes & 15)) & 15;
+ 
+     u64 memSizeK = N * (bin - LOG_AES_BLOCK_LEN) * sizeof(AESBlock);
+     AESBlock *d_k0 = (AESBlock *)gpuMalloc(memSizeK);
+@@ -414,7 +417,7 @@ void doDpfTreeKeyGen(u8 **key_as_bytes, int party, int bin, int N,
+     auto d_s0 = randomAESBlockOnGpu(N);
+     auto d_s1 = randomAESBlockOnGpu(N);
+     keyGenDPFTreeKernel<<<(N - 1) / 256 + 1, 256>>>(party, bin, N, d_rin, d_s0, d_s1, d_k0, d_l0, d_l1, d_tR, *gaes, evalAll);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     moveIntoCPUMem(*key_as_bytes, (u8 *)d_k0, memSizeK, NULL);
+ 
+     *key_as_bytes += memSizeK;
+diff --git a/GPU-MPC/fss/gpu_dpf.h b/GPU-MPC/fss/gpu_dpf.h
+index c963e02..8d13235 100644
+--- a/GPU-MPC/fss/gpu_dpf.h
++++ b/GPU-MPC/fss/gpu_dpf.h
+@@ -51,6 +51,9 @@ GPUDPFTreeKey readGPUDPFTreeKey(u8 **key_as_bytes)
+ 
+     std::memcpy((char *)&k, *key_as_bytes, 3 * sizeof(int));
+     *key_as_bytes += 3 * sizeof(int);
++    // keep AESBlock components 16B-aligned (mirrors doDpfTreeKeyGen padding,
++    // required for GPU-resident keys: device mirror inherits host alignment)
++    *key_as_bytes += (16 - ((uintptr_t)*key_as_bytes & 15)) & 15;
+ 
+     k.szScw = k.N * (k.bin - LOG_AES_BLOCK_LEN);
+     k.memSzScw = k.szScw * sizeof(AESBlock);
+diff --git a/GPU-MPC/fss/gpu_layernorm.cu b/GPU-MPC/fss/gpu_layernorm.cu
+index a9dee45..ab4dd15 100644
+--- a/GPU-MPC/fss/gpu_layernorm.cu
++++ b/GPU-MPC/fss/gpu_layernorm.cu
+@@ -63,7 +63,7 @@ T *gpuSum(int bw, int M, int N, T *d_X)
+     CUTLASS_CHECK(status);
+     if (bw < 8 * sizeof(T))
+         modKernel<<<(M - 1) / 128 + 1, 128>>>(M, d_Y, bw);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     gpuFree(workspace);
+     // auto h_Y = (T*) moveToCPU((u8*) d_Y, 1 * sizeof(T), NULL);
+     // printf("%ld\n", h_Y[0]);
+@@ -106,7 +106,7 @@ T *pointFunc(int party, int bw, int N, T *d_X, u8 *bytes)
+ {
+     T *d_O = (T *)gpuMalloc(N * sizeof(T));
+     applyPointFunc<T, p><<<(N - 1) / 128 + 1, 128>>>(party, bw, N, d_X, d_O, bytes);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_O;
+ }
+ 
+diff --git a/GPU-MPC/fss/gpu_linear_helper.cu b/GPU-MPC/fss/gpu_linear_helper.cu
+index bea8caf..b87f81f 100644
+--- a/GPU-MPC/fss/gpu_linear_helper.cu
++++ b/GPU-MPC/fss/gpu_linear_helper.cu
+@@ -80,7 +80,7 @@ void gpuAddBias(int batchSz, int M, int N, int bw, T *d_A, T *h_b, Stats *s)
+     size_t memSizeB = batchSz * N * sizeof(T);
+     auto d_b = (T *)moveToGPU((uint8_t *)h_b, memSizeB, s);
+     addBiasKernel<<<(batchSz * M * N - 1) / 128 + 1, 128>>>(batchSz, M, N, bw, d_A, d_b);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     gpuFree(d_b);
+ }
+ 
+@@ -124,7 +124,7 @@ T *getBiasGrad(int N, int M, int bw, T *d_A)
+         T(0)                   // reduction_identity
+     );
+     CUTLASS_CHECK(status);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     gpuFree(workspace);
+ 
+     return d_b;
+@@ -159,7 +159,7 @@ void gpuLeftShiftAndAdd(int N, T *d_A, T *d_B, T *d_C, int shift, T alpha)
+ {
+     assert(shift < sizeof(T) * 64);
+     leftShiftAndAddKernel<<<(N - 1) / 256 + 1, 256>>>(d_A, d_B, d_C, shift, alpha, N);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+ }
+ 
+ template <typename T>
+diff --git a/GPU-MPC/fss/gpu_local_truncate.h b/GPU-MPC/fss/gpu_local_truncate.h
+index 13127d1..c4e0f95 100644
+--- a/GPU-MPC/fss/gpu_local_truncate.h
++++ b/GPU-MPC/fss/gpu_local_truncate.h
+@@ -57,6 +57,6 @@ TOut *gpuLocalTr(int party, int bin, int shift, int N, TIn *d_I, bool inPlace =
+     assert(bin >= shift);
+     TOut* d_O = inPlace ? (TOut*) d_I : (TOut*) gpuMalloc(N * sizeof(TOut));
+     localTrKernel<TIn, TOut, tf><<<(N - 1) / 128 + 1, 128>>>(party, bin, shift, N, d_I, d_O);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_O;
+ }
+\ No newline at end of file
+diff --git a/GPU-MPC/fss/gpu_lut.cu b/GPU-MPC/fss/gpu_lut.cu
+index 01ef611..cd3249e 100644
+--- a/GPU-MPC/fss/gpu_lut.cu
++++ b/GPU-MPC/fss/gpu_lut.cu
+@@ -168,10 +168,13 @@ TOut *gpuDpfLUT(GPULUTKey<TOut> k0, SigmaPeer *peer, int party, TIn *d_X, TOut *
+     d_l0 = (AESBlock *)moveToGPU((uint8_t *)k.l0, k.memSzL, s);
+     d_l1 = (AESBlock *)moveToGPU((uint8_t *)k.l1, k.memSzL, s);
+     d_tR = (u32 *)moveToGPU((uint8_t *)k.tR, k.memSzT, s);
+-    auto d_U = (u32 *)moveToGPU((u8 *)k0.maskU, k.memSzOut, s); // a lot of bits packed together
+-    auto d_V = (TOut *)moveToGPU((u8 *)k0.s.b, k.N * sizeof(TOut), s);
++    // Written in place by the dpfLUT kernel (writeVCW / V[threadId] += v) and by
++    // reconstructInPlace below, so these must be writable copies, not read-only
++    // key-arena images.
++    auto d_U = (u32 *)moveToGPUWritable((u8 *)k0.maskU, k.memSzOut, s); // a lot of bits packed together
++    auto d_V = (TOut *)moveToGPUWritable((u8 *)k0.s.b, k.N * sizeof(TOut), s);
+     dpfLUT<TIn, TOut><<<tb, tbSz /*, shmSize*/>>>(party, k.bin, k.N, d_X, d_tab, d_scw, d_stack, d_l0, d_l1, d_tR, d_U, d_V, *g);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+ 
+     gpuFree(d_scw);
+     gpuFree(d_stack);
+diff --git a/GPU-MPC/fss/gpu_matmul.cu b/GPU-MPC/fss/gpu_matmul.cu
+index 08e40f7..dde2bea 100644
+--- a/GPU-MPC/fss/gpu_matmul.cu
++++ b/GPU-MPC/fss/gpu_matmul.cu
+@@ -117,7 +117,7 @@ T *cutlassMatmul(MatmulParams p, T *d_A, T *d_B, T *d_C, bool cIsBias = false)
+         assert(false && "no option matches!");
+     }
+     CUTLASS_CHECK(status);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_D;
+ }
+ 
+@@ -144,7 +144,7 @@ T *cutlassMatmulWrapper(MatmulParams p, T *d_A, T *d_B, T *d_C, bool cIsBias = f
+     if (reduceBw && p.bw < sizeof(T) * 8)
+     {
+         modKernel<<<(p.size_C - 1) / 128 + 1, 128>>>(p.size_C, d_O, p.bw);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+     }
+     return d_O;
+ }
+@@ -241,7 +241,7 @@ T *packLowerTriangularMatrix(MatmulParams p, T *d_A)
+     // printf("Packing matrix=%d\n", p.size_C);
+     auto d_packed_A = (T *)gpuMalloc(p.size_C * sizeof(T));
+     packLowerTriangularKernel<<<(p.size_C - 1) / 128 + 1, 128>>>(p, d_A, d_packed_A);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_packed_A;
+ }
+ 
+@@ -317,7 +317,7 @@ T *gpuMatmulBeaver(MatmulParams p, GPUMatmulKey<T> k, int party, T *d_A, T *d_B,
+     }
+     d_C1 = cutlassMatmulWrapper<T>(p, d_A, d_r1, d_bias, true);
+     d_C2 = cutlassMatmulWrapper<T>(p, d_r0, d_B, NULL);
+-    T *d_C = (T *)moveToGPU((u8 *)k.C, k.mem_size_C, s);
++    T *d_C = (T *)moveToGPUWritable((u8 *)k.C, k.mem_size_C, s);  // writable: gpuLinearComb writes result into d_C
+     gpuLinearComb(p.bw, p.size_C, d_C, T(1), d_C, party == SERVER0 ? T(1) : T(-1), d_C1, T(-1), d_C2);
+     gpuFree(d_C1);
+     gpuFree(d_C2);
+@@ -334,7 +334,7 @@ T *gpuMatmul(SigmaPeer *peer, int party, MatmulParams p, GPUMatmulKey<T> &k, T *
+     auto d_W = h_W;
+     if (!wIsOnGpu)
+         d_W = (T *)moveToGPU((u8 *)h_W, k.mem_size_B, s);
+-    auto d_mask_W = (T *)moveToGPU((u8 *)k.B, k.mem_size_B, s);
++    auto d_mask_W = (T *)moveToGPUWritable((u8 *)k.B, k.mem_size_B, s);  // writable: gpuMatmulBeaver writes into d_r1 (party 0)
+     T *d_Y = NULL;
+     // printf("N=%d, batchSz=%d\n", p.N, p.batchSz);
+     if (party == SERVER0 && h_Y)
+diff --git a/GPU-MPC/fss/gpu_maxpool.cu b/GPU-MPC/fss/gpu_maxpool.cu
+index 003901b..005a177 100644
+--- a/GPU-MPC/fss/gpu_maxpool.cu
++++ b/GPU-MPC/fss/gpu_maxpool.cu
+@@ -90,7 +90,7 @@ T *gpuMaxpoolLinHelper(SigmaPeer *peer, int party, MaxpoolParams p, GPUReluKey<T
+     T *d_diff = (T *)gpuMalloc(outSz * sizeof(T));
+     // int tb_size = 256;
+     diffWithCurMax<<<(outSz - 1) / 256 + 1, 256>>>(p, fh, fw, d_curMax, d_in, d_diff, outSz);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     // relu(x-y)
+     auto d_newMax = gpuRelu<T, T, 0, 0, false>(peer, party, k, d_diff, gaes, s);
+     gpuFree(d_diff);
+@@ -132,7 +132,7 @@ T *gpuKeygenMaxpoolLinHelper(u8 **key_as_bytes, int party, MaxpoolParams p, int
+     T *d_diffMask = (T *)gpuMalloc(outSz * sizeof(T));
+     // int tb_size = 256;
+     diffWithCurMax<<<(outSz - 1) / 256 + 1, 256>>>(p, fh, fw, d_curMaxMask, d_inputMask, d_diffMask, outSz);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     // auto d_newMaxMask = randomGEOnGpu<T>(outSz, p.bw);
+     // relu(x-y)
+     auto d_newMaxMask = gpuGenReluKey<T, T, 0, 0, false>(key_as_bytes, party, p.bin, p.bw, outSz, d_diffMask, gaes);
+@@ -566,7 +566,7 @@ T *gpuSelectForMaxpoolBackprop(MaxpoolParams p, GPUSelectKey<T> k,
+ 
+     selectForMaxpoolBackpropKernel<T><<<(k.N - 1) / tb_size + 1, tb_size>>>(p, d_oneHot,
+                                                                             d_incomingGrad, d_out, d_a, d_b, d_c, d_d1, d_d2, party, k.N);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+ 
+     gpuFree(d_a);
+     return d_out;
+@@ -592,7 +592,7 @@ void gpuAndForMaxpool(MaxpoolParams p, int pos, GPUAndKey k,
+     int numElems = p.N * p.H * p.W * p.C * p.FH * p.FW;
+     andForMaxpoolKernel<<<(numElems - 1) / tb_size + 1, tb_size>>>(p, pos, d_drelu, d_oneHot,
+                                                                    d_b0, d_b1, d_b2, party, numElems);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+ 
+     gpuFree(d_b0);
+ }
+@@ -606,7 +606,7 @@ T *gpuCollectGradients(MaxpoolParams p, T *d_outgoingGradExpanded, Stats *s)
+     const int tbSize = 256;
+     assert(p.zPadHLeft == 0 && p.zPadHRight == 0 && p.zPadWLeft == 0 && p.zPadWRight == 0);
+     gpuCollectGradientsKernel<<<(outgoingGradSize - 1) / tbSize + 1, tbSize>>>(p, d_outgoingGradExpanded, d_outgoingGrad, outgoingGradSize);
+-    cudaDeviceSynchronize();
++    checkCudaErrors(cudaGetLastError());
+     checkCudaErrors(cudaGetLastError());
+     return d_outgoingGrad;
+ }
+diff --git a/GPU-MPC/fss/gpu_select.cu b/GPU-MPC/fss/gpu_select.cu
+index b5b5a8a..d5fe2c7 100644
+--- a/GPU-MPC/fss/gpu_select.cu
++++ b/GPU-MPC/fss/gpu_select.cu
+@@ -61,14 +61,14 @@ TOut *gpuSelect(SigmaPeer *peer, int party, int bw, GPUSelectKey<TOut> k, u32 *d
+     assert(bw <= 8 * sizeof(TOut));
+     size_t memSz = k.N * sizeof(TOut);
+ 
+-    TOut *d_a = (TOut *)moveToGPU((uint8_t *)k.a, memSz, s);
++    TOut *d_a = (TOut *)moveToGPUWritable((uint8_t *)k.a, memSz, s);  // writable: selectKernel writes result into d_a
+     TOut *d_b = (TOut *)moveToGPU((uint8_t *)k.b, memSz, s);
+     TOut *d_c = (TOut *)moveToGPU((uint8_t *)k.c, memSz, s);
+     TOut *d_d1 = (TOut *)moveToGPU((uint8_t *)k.d1, memSz, s);
+     TOut *d_d2 = (TOut *)moveToGPU((uint8_t *)k.d2, memSz, s);
+     // printf("Doing select\n");
+     selectKernel<TIn, TOut, p, q><<<(k.N - 1) / 256 + 1, 256>>>(d_x, d_Y, d_a, d_b, d_c, d_d1, d_d2, party, k.N, bw);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     // printf("finished kernel\n");
+     if (opMasked)
+         peer->reconstructInPlace(d_a, bw, k.N, s);
+@@ -122,7 +122,7 @@ TOut *gpuKeyGenSelect(uint8_t **key_as_bytes, int party, int N, TIn *d_maskX, TM
+     auto d_oneBitK2 = (TOut *)gpuMalloc(N * sizeof(TOut));
+     // printf("Bw=%d\n", bw);
+     keyGenSelectKernel<<<(N - 1) / 256 + 1, 256>>>(N, d_maskB, d_maskX, d_randomMaskOut, d_out, d_oneBitK1, d_oneBitK2, bw);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     writeShares<TMaskB, TOut>(key_as_bytes, party, N, d_maskB, bw);
+     writeShares<TIn, TOut>(key_as_bytes, party, N, d_maskX, bw);
+     writeShares<TOut, TOut>(key_as_bytes, party, N, d_out, bw);
+diff --git a/GPU-MPC/fss/gpu_sstab.h b/GPU-MPC/fss/gpu_sstab.h
+index adc7e92..015acb0 100644
+--- a/GPU-MPC/fss/gpu_sstab.h
++++ b/GPU-MPC/fss/gpu_sstab.h
+@@ -84,7 +84,7 @@ u32 *gpuLookupSSTable(GPUSSTabKey &k, int party, T *d_in, Stats* s, std::vector<
+     // printf("Bin=%d, Memsz=%ld\n", k.bin, k.memSzSS);
+     auto d_ss = (u8 *)moveToGPU((u8 *)k.ss, k.memSzSS, s);
+     lookupSSTable<T, E, pr, ep><<<(k.N - 1) / 128 + 1, 128>>>(party, k.bin, k.N, d_in, d_ss, d_out);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     gpuFree(d_ss);
+     return d_out;
+ }
+diff --git a/GPU-MPC/fss/gpu_truncate.cu b/GPU-MPC/fss/gpu_truncate.cu
+index aaff460..f6ab68d 100644
+--- a/GPU-MPC/fss/gpu_truncate.cu
++++ b/GPU-MPC/fss/gpu_truncate.cu
+@@ -127,7 +127,7 @@ TOut *gpuKeygenTrFunc(u8 **key_as_bytes, int party, int bin, int shift, int bout
+     // cudaMemset(d_outMask, 0, N * sizeof(TOut));
+     auto d_trKey = (TOut *)gpuMalloc(m * N * sizeof(TOut));
+     keygenTrFuncKernel<TIn, TOut, tf><<<(N - 1) / 128 + 1, 128>>>(party, bin, shift, bout, N, d_inputMask, d_outMask, d_dcfMask, d_trKey, bytes);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+ 
+     writeShares<TIn, TIn>(key_as_bytes, party, N, d_dcfMask, 1);
+     writeShares<TOut, TOut>(key_as_bytes, party, m * N, (TOut *)d_trKey, bout);
+@@ -216,7 +216,7 @@ TOut *gpuTrHelper(int party, SigmaPeer *peer, int bin, int shift, int bout, int
+     auto d_corr = (TOut *)moveToGPU((u8 *)k.corr, 2 * memSz, s);
+     auto d_O = (TOut *)gpuMalloc(memSz);
+     trCorrKernel<TIn, TOut, tf><<<(N - 1) / 128 + 1, 128>>>(party, bin, shift, bout, N, d_X, d_b, d_corr, d_O, d_bytes);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     gpuFree(d_corr);
+     gpuFree(d_b);
+ 
+diff --git a/GPU-MPC/fss/gpu_window.cu b/GPU-MPC/fss/gpu_window.cu
+index 09910f9..90195b0 100644
+--- a/GPU-MPC/fss/gpu_window.cu
++++ b/GPU-MPC/fss/gpu_window.cu
+@@ -105,7 +105,7 @@ T *windowFunc(int party, MaxpoolParams p, T *d_X, T *d_M, u8 *d_bytes = NULL, bo
+     assert(p.strideH == p.FH && p.strideW == p.FW);
+     assert(p.zPadHLeft == 0 && p.zPadHRight == 0 && p.zPadWLeft == 0 && p.zPadWRight == 0);
+     windowFuncKernel<T, f><<<(inSz - 1) / 128 + 1, 128>>>(party, p, d_X, d_M, d_out, inSz, mSz, d_bytes);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     return d_out;
+ }
+ 
+diff --git a/GPU-MPC/utils/gpu_comms.h b/GPU-MPC/utils/gpu_comms.h
+index fb12d01..288fc27 100644
+--- a/GPU-MPC/utils/gpu_comms.h
++++ b/GPU-MPC/utils/gpu_comms.h
+@@ -109,7 +109,7 @@ private:
+             u64 threads = memSz / 8; //(memSz - 1) / 8 + 1;
+             // printf("%lu\n", threads);
+             compressKernel<<<(threads - 1) / 128 + 1, 128>>>(bw, modBw, threads, N, d_A0, d_compressedA0);
+-            checkCudaErrors(cudaDeviceSynchronize());
++            checkCudaErrors(cudaGetLastError());
+         }
+         else
+         {
+@@ -139,7 +139,7 @@ private:
+             memSz = size_t(N * sizeof(T));
+             d_A = (T *)gpuMalloc(memSz);
+             expandKernel<<<(N - 1) / 128 + 1, 128>>>(bw, N, d_compressedA, (T *)d_A);
+-            checkCudaErrors(cudaDeviceSynchronize());
++            checkCudaErrors(cudaGetLastError());
+             gpuFree(d_compressedA);
+         }
+         else
+@@ -158,7 +158,7 @@ private:
+         int numInts = (2 * N - 1) / 32 + 1;
+         // printf("numInts: %d\n", numInts);
+         addMod4<<<(numInts - 1) / thread_blk_size + 1, thread_blk_size>>>(numInts, d_A, d_B);
+-        checkCudaErrors(cudaDeviceSynchronize());
++        checkCudaErrors(cudaGetLastError());
+     }
+ 
+     template <typename T>
+diff --git a/GPU-MPC/utils/gpu_file_utils.cpp b/GPU-MPC/utils/gpu_file_utils.cpp
+index fb95784..2da6cdc 100644
+--- a/GPU-MPC/utils/gpu_file_utils.cpp
++++ b/GPU-MPC/utils/gpu_file_utils.cpp
+@@ -113,6 +113,8 @@ int openForReading(std::string filename)
+ {
+     printf("Opening file=%s\n", filename.data());
+     int fd = open(filename.data(), O_RDONLY | O_DIRECT | O_LARGEFILE);
++    if (fd == -1 && errno == EINVAL)
++        fd = open(filename.data(), O_RDONLY | O_LARGEFILE);  // tmpfs lacks O_DIRECT
+     if (fd == -1)
+         assert(0 && "fopen");
+     lseek(fd, 0, SEEK_SET);
+@@ -122,6 +124,8 @@ int openForReading(std::string filename)
+ int openForWriting(std::string filename)
+ {
+     int fd = open(filename.data(), O_WRONLY | O_DIRECT | O_LARGEFILE | O_TRUNC | O_CREAT, 0644);
++    if (fd == -1 && errno == EINVAL)
++        fd = open(filename.data(), O_WRONLY | O_LARGEFILE | O_TRUNC | O_CREAT, 0644);  // tmpfs lacks O_DIRECT
+     if (fd == -1)
+         assert(0 && "fopen");
+     return fd;
+diff --git a/GPU-MPC/utils/gpu_mem.cu b/GPU-MPC/utils/gpu_mem.cu
+index f241ad4..028d606 100644
+--- a/GPU-MPC/utils/gpu_mem.cu
++++ b/GPU-MPC/utils/gpu_mem.cu
+@@ -20,6 +20,8 @@
+ // SOFTWARE.
+ 
+ #include <chrono>
++#include <cstdlib>
++#include <execinfo.h>
+ 
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+@@ -32,6 +34,85 @@
+ 
+ cudaMemPool_t mempool;
+ 
++// ── GPU-resident key arena ──────────────────────────────────────────────────
++// The party's whole FSS key file is bulk-uploaded to the GPU once at online
++// start. Afterwards, moveToGPU() on any host pointer inside the key buffer
++// returns the device mirror with NO copy, and gpuFree() on arena pointers is
++// a no-op. This eliminates the per-op malloc+H2D+free cycle for key material.
++// Env: DDG_KEY_ARENA=0 disables; DDG_KEY_ARENA_PCT (default 40) caps the
++// arena to that % of free VRAM (two parties share one GPU); if the keys do
++// not fit, the arena stays inactive and the old per-op path is used.
++static uint8_t *g_keyArenaHost = nullptr;
++static uint8_t *g_keyArenaDev = nullptr;
++static size_t g_keyArenaSize = 0;
++
++static inline bool arenaOwnsHostPtr(const void *h)
++{
++    return g_keyArenaDev && h &&
++           (uintptr_t)h - (uintptr_t)g_keyArenaHost < g_keyArenaSize;
++}
++
++static inline bool arenaOwnsDevPtr(const void *d)
++{
++    return g_keyArenaDev && d &&
++           (uintptr_t)d - (uintptr_t)g_keyArenaDev < g_keyArenaSize;
++}
++
++extern "C" bool initGPUKeyArena(uint8_t *h_base, size_t size)
++{
++    const char *dis = getenv("DDG_KEY_ARENA");
++    if (dis && dis[0] == '0')
++    {
++        printf("[keyArena] disabled via DDG_KEY_ARENA=0\n");
++        return false;
++    }
++    const char *pctEnv = getenv("DDG_KEY_ARENA_PCT");
++    int pct = pctEnv ? atoi(pctEnv) : 40;
++    size_t freeB = 0, totalB = 0;
++    checkCudaErrors(cudaMemGetInfo(&freeB, &totalB));
++    if (size > freeB * (size_t)pct / 100)
++    {
++        printf("[keyArena] keys %.1f GB exceed %d%% of free VRAM %.1f GB — per-op key upload fallback\n",
++               size / 1e9, pct, freeB / 1e9);
++        return false;
++    }
++    uint8_t *d = nullptr;
++    checkCudaErrors(cudaMalloc(&d, size));
++    auto start = std::chrono::high_resolution_clock::now();
++    checkCudaErrors(cudaMemcpy(d, h_base, size, cudaMemcpyHostToDevice));
++    auto end = std::chrono::high_resolution_clock::now();
++    g_keyArenaHost = h_base;
++    g_keyArenaDev = d;
++    g_keyArenaSize = size;
++    printf("[keyArena] uploaded %.2f GB keys to GPU in %ld ms\n", size / 1e9,
++           std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
++    return true;
++}
++
++extern "C" void freeGPUKeyArena()
++{
++    if (g_keyArenaDev)
++    {
++        cudaFree(g_keyArenaDev);
++        g_keyArenaDev = nullptr;
++        g_keyArenaHost = nullptr;
++        g_keyArenaSize = 0;
++    }
++}
++
++// Slot mode for chunked streaming eval (DDG_NUM_CHUNKS > 1): the caller owns
++// double-buffered pinned host slots + VRAM slots (one chunk of the key file
++// each) and repoints the arena mapping at the active chunk's slot before each
++// forward. No allocation, no copy, no free — the caller manages the buffers
++// and the VRAM budget (2 slots x chunkKeySize). moveToGPU / gpuFree translate
++// against whatever slot is currently bound, exactly like the whole-file arena.
++extern "C" void setGPUKeyArenaSlot(uint8_t *h_base, uint8_t *d_base, size_t size)
++{
++    g_keyArenaHost = h_base;
++    g_keyArenaDev = d_base;
++    g_keyArenaSize = size;
++}
++
+ extern "C" void initGPUMemPool()
+ {
+     int isMemPoolSupported = 0;
+@@ -76,6 +157,8 @@ extern "C" uint8_t *cpuMalloc(size_t size_in_bytes, bool pin)
+ 
+ extern "C" void gpuFree(void *d_a)
+ {
++    if (arenaOwnsDevPtr(d_a))
++        return;  // arena memory is bulk-managed, never freed per-op
+     checkCudaErrors(cudaFreeAsync(d_a, 0));
+ }
+ 
+@@ -112,7 +195,18 @@ extern "C" uint8_t *moveIntoGPUMem(uint8_t *d_a, uint8_t *h_a, size_t size_in_by
+ extern "C" uint8_t *moveIntoCPUMem(uint8_t *h_a, uint8_t *d_a, size_t size_in_bytes, Stats *s)
+ {
+     auto start = std::chrono::high_resolution_clock::now();
+-    checkCudaErrors(cudaMemcpy(h_a, d_a, size_in_bytes, cudaMemcpyDeviceToHost));
++    if (getenv("DDG_DEBUG_XFER"))
++        fprintf(stderr, "[xfer] moveIntoCPUMem h=%p d=%p size=%zu\n", (void *)h_a, (void *)d_a, size_in_bytes);
++    cudaError_t e = cudaMemcpy(h_a, d_a, size_in_bytes, cudaMemcpyDeviceToHost);
++    if (e != cudaSuccess && getenv("DDG_DEBUG_XFER"))
++    {
++        void *bt[32];
++        int n = backtrace(bt, 32);
++        fprintf(stderr, "[xfer] FAILED moveIntoCPUMem h=%p d=%p size=%zu err=%d backtrace:\n",
++                (void *)h_a, (void *)d_a, size_in_bytes, (int)e);
++        backtrace_symbols_fd(bt, n, 2);
++    }
++    checkCudaErrors(e);
+     auto end = std::chrono::high_resolution_clock::now();
+     auto elapsed = end - start;
+     if (s)
+@@ -122,6 +216,8 @@ extern "C" uint8_t *moveIntoCPUMem(uint8_t *h_a, uint8_t *d_a, size_t size_in_by
+ 
+ extern "C" uint8_t *moveToGPU(uint8_t *h_a, size_t size_in_bytes, Stats *s)
+ {
++    if (arenaOwnsHostPtr(h_a))
++        return g_keyArenaDev + ((uintptr_t)h_a - (uintptr_t)g_keyArenaHost);  // already GPU-resident
+     uint8_t *d_a = gpuMalloc(size_in_bytes);
+     auto start = std::chrono::high_resolution_clock::now();
+     checkCudaErrors(cudaMemcpy(d_a, h_a, size_in_bytes, cudaMemcpyHostToDevice));
+@@ -131,3 +227,20 @@ extern "C" uint8_t *moveToGPU(uint8_t *h_a, size_t size_in_bytes, Stats *s)
+         s->transfer_time += std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+     return d_a;
+ }
++
++// For callers that need a WRITABLE device copy of key material (they write to
++// the buffer, e.g. gpuSelect's d_a, gpuMatmulBeaver's d_C / d_r1). With the
++// key arena active, a plain moveToGPU would hand them the read-only master
++// copy and corrupt the keys — so clone D2D into a fresh pool buffer instead.
++extern "C" uint8_t *moveToGPUWritable(uint8_t *h_a, size_t size_in_bytes, Stats *s)
++{
++    if (arenaOwnsHostPtr(h_a))
++    {
++        uint8_t *d_a = gpuMalloc(size_in_bytes);
++        checkCudaErrors(cudaMemcpyAsync(d_a,
++                                        g_keyArenaDev + ((uintptr_t)h_a - (uintptr_t)g_keyArenaHost),
++                                        size_in_bytes, cudaMemcpyDeviceToDevice, 0));
++        return d_a;
++    }
++    return moveToGPU(h_a, size_in_bytes, s);
++}
+diff --git a/GPU-MPC/utils/gpu_mem.h b/GPU-MPC/utils/gpu_mem.h
+index e125937..cc57604 100644
+--- a/GPU-MPC/utils/gpu_mem.h
++++ b/GPU-MPC/utils/gpu_mem.h
+@@ -32,7 +32,13 @@ extern "C" uint8_t *cpuMalloc(size_t size_in_bytes, bool pin = true);
+ extern "C" void cpuFree(void *h_a, bool pinned = true);
+ extern "C" void gpuFree(void *d_a);
+ extern "C" uint8_t *moveToGPU(uint8_t *h_a, size_t size_in_bytes, Stats *);
++extern "C" uint8_t *moveToGPUWritable(uint8_t *h_a, size_t size_in_bytes, Stats *);
+ extern "C" uint8_t *moveIntoGPUMem(uint8_t *d_a, uint8_t *h_a, size_t size_in_bytes, Stats *s);
+ extern "C" uint8_t *moveToCPU(uint8_t *d_a, size_t size_in_bytes, Stats *);
+ extern "C" uint8_t *moveIntoCPUMem(uint8_t *h_a, uint8_t *d_a, size_t size_in_bytes, Stats *s);
+-extern "C" void initGPUMemPool();
+\ No newline at end of file
++extern "C" void initGPUMemPool();
++extern "C" bool initGPUKeyArena(uint8_t *h_base, size_t size);
++extern "C" void freeGPUKeyArena();
++// Chunked streaming mode: rebind the arena mapping to a caller-owned
++// (host, device) slot pair without copying (see gpu_mem.cu).
++extern "C" void setGPUKeyArenaSlot(uint8_t *h_base, uint8_t *d_base, size_t size);
+\ No newline at end of file
+diff --git a/GPU-MPC/utils/gpu_random.cu b/GPU-MPC/utils/gpu_random.cu
+index 7882fe6..b0d66b0 100644
+--- a/GPU-MPC/utils/gpu_random.cu
++++ b/GPU-MPC/utils/gpu_random.cu
+@@ -169,7 +169,7 @@ void writeShares(u8 **key_as_bytes, int party, u64 N, TIn *d_A, int bw, bool ran
+   auto d_packed_A = (u32 *)gpuMalloc(memSzA);
+ 
+   getPackedSharesKernel<<<(N - 1) / 256 + 1, 256>>>(N, party, d_A, d_A0, d_packed_A, bw);
+-  checkCudaErrors(cudaDeviceSynchronize());
++  checkCudaErrors(cudaGetLastError());
+ 
+   moveIntoCPUMem((u8 *)*key_as_bytes, (u8 *)d_packed_A, memSzA, NULL);
+   *key_as_bytes += memSzA;
+diff --git a/GPU-MPC/utils/misc_utils.h b/GPU-MPC/utils/misc_utils.h
+index 7ddbada..dbaf97c 100644
+--- a/GPU-MPC/utils/misc_utils.h
++++ b/GPU-MPC/utils/misc_utils.h
+@@ -99,7 +99,7 @@ void gpuLinearComb(int bw, int N, T *d_O, Arguments... args)
+ {
+     const int thread_block_size = 128;
+     linearCombWrapper<<<(N - 1) / thread_block_size + 1, thread_block_size>>>(bw, N, d_O, args...);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     // checkCudaErrors(cudaGetLastError());
+ }
+ 
+@@ -108,7 +108,7 @@ void gpuXor(T *d_A, T *d_B, int N, Stats *s)
+ {
+     const int thread_block_size = 128;
+     xorKernel<<<(N - 1) / thread_block_size + 1, thread_block_size>>>(d_A, d_B, N);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+ }
+ 
+ void writeInt(u8 **key_as_bytes, int N)
+@@ -134,7 +134,7 @@ void unmaskValues(int bw, int N, T *d_A, T *h_mask_A, Stats *s)
+ {
+     auto d_mask_A = (T *)moveToGPU((u8 *)h_mask_A, N * sizeof(T), s);
+     unmaskKernel<<<(N - 1) / 256 + 1, 256>>>(bw, N, d_A, d_mask_A);
+-    checkCudaErrors(cudaDeviceSynchronize());
++    checkCudaErrors(cudaGetLastError());
+     gpuFree(d_mask_A);
+     // return d_A;
+ }

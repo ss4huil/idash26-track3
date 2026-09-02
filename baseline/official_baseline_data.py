@@ -40,7 +40,7 @@ from torch_geometric.loader import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
 # DeepDTAGen project must be importable for model.py + utils.py
-DEEPDTAGEN_DIR = "/home/jiang/master/idash/project/DeepDTAGen"
+DEEPDTAGEN_DIR = os.environ.get("DEEPDTAGEN_DIR", "/home/ecs-user/idash26/DeepDTAGen")
 if DEEPDTAGEN_DIR not in sys.path:
     sys.path.insert(0, DEEPDTAGEN_DIR)
 

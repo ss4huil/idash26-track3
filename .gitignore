@@ -58,3 +58,18 @@ gpu_mpc/**/golden_affinities.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Track3 local test artifacts
+gpu_mpc/timing_*/
+gpu_mpc/eval_*/
+gpu_mpc/scaling_*/
+gpu_mpc/dbg_*/
+gpu_mpc/smoke/
+gpu_mpc/davis_sample/
+gpu_mpc/*.log
+gpu_mpc/pool_override.o
+gpu_mpc/deepdtagen_inference_baseline
+gpu_mpc/deepdtagen_inference_bw32
+gpu_mpc/deepdtagen_inference_bw64
+data/kiba_test.csv
+results_full_davis*.json*

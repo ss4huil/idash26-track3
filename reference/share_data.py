@@ -24,7 +24,7 @@ import os
 import numpy as np
 
 from reference import mpc_config
-from reference.dense_graph import smile_to_dense_graph
+from reference.dense_graph import smile_to_dense_graph, smile_to_dense_raw_graph
 
 U64_MOD = 1 << 64
 U32_MOD = 1 << 32
@@ -129,4 +129,31 @@ def share_drug_graph(smile: str, out_dir: str,
     _write_pair(mask_tiled, out_dir, "mask", scale, seed + 2, bw=bw)
     return {"nmax": nmax, "scale": scale, "pool_dim": pool_dim, "bw": bw,
             "shapes": {"x": list(X.shape), "adj": list(A_hat.shape),
+                       "mask": list(mask_tiled.shape)}}
+
+
+def share_drug_graph_raw_adj(smile: str, out_dir: str,
+                             scale: int = DEFAULT_SCALE, nmax: int = 138,
+                             seed: int = 0, pool_dim: int = 376,
+                             bw: int = DEFAULT_BW):
+    """Secret-share drug inputs for the compliant raw-adjacency MPC path.
+
+    Same tensor contract as share_drug_graph, except `adj` is the RAW 0/1
+    adjacency with real-node self-loops written at scale=0 (it is an integer
+    tensor; degree normalization happens inside the timed MPC path via the
+    LUT protocol in secure_adj_norm.h). `x` and `mask` stay at `scale`, so
+    this remains compatible with the masked-maxpool mask encoding.
+
+    Consumed by deepdtagen_inference built with the DDG_SECURE_ADJ_NORM
+    environment variable set on both dealer and evaluators.
+    """
+    X, A_raw, mask = smile_to_dense_raw_graph(smile, nmax)
+    mask_tiled = np.broadcast_to(mask.reshape(nmax, 1),
+                                 (nmax, pool_dim))          # (nmax, pool_dim)
+    _write_pair(X,          out_dir, "x",    scale, seed + 0, bw=bw)
+    _write_pair(A_raw,      out_dir, "adj",  0,     seed + 1, bw=bw)
+    _write_pair(mask_tiled, out_dir, "mask", scale, seed + 2, bw=bw)
+    return {"nmax": nmax, "scale": scale, "adj_scale": 0, "pool_dim": pool_dim,
+            "bw": bw, "adj_semantics": "raw_binary_adjacency_with_self_loops",
+            "shapes": {"x": list(X.shape), "adj": list(A_raw.shape),
                        "mask": list(mask_tiled.shape)}}

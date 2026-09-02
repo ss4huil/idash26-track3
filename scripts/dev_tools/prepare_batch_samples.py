@@ -31,13 +31,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from reference import mpc_config, share_data, protein_plaintext, export_weights
 from reference.affinity_model import AffinityModel
-from reference.dense_graph import smile_to_dense_graph
+from reference.dense_graph import smile_to_dense_graph, smile_to_dense_raw_graph
 from baseline import official_baseline_data as ob
 
 
 def prepare_batch_samples(dataset: str, csv_path: str, row_indices: list,
                          out_dir: str, batch_name: str,
-                         scale: int = 12, bw: int = 32) -> dict:
+                         scale: int = 12, bw: int = 32,
+                         raw_adj: bool = False) -> dict:
     """
     Prepare a batch of samples for MPC inference.
 
@@ -49,6 +50,10 @@ def prepare_batch_samples(dataset: str, csv_path: str, row_indices: list,
         batch_name: Name of the batch subdirectory
         scale: Fixed-point scale (fractional bits)
         bw: Bit width (32 or 64)
+        raw_adj: If True, write the RAW 0/1 adjacency (self-loops, no degree
+                 normalization) as adj shares at scale=0, for the
+                 DDG_SECURE_ADJ_NORM online-normalization path. mask shares
+                 stay at `scale` (masked-maxpool encoding unchanged).
 
     Returns:
         dict: Manifest containing batch metadata
@@ -89,14 +94,18 @@ def prepare_batch_samples(dataset: str, csv_path: str, row_indices: list,
         protein_seqs.append(row["protein_seq"])
 
         # Convert SMILES to dense graph (float tensors)
-        X_fp, A_hat_fp, mask_fp = smile_to_dense_graph(row["smile"], NMAX)
+        if raw_adj:
+            # Compliant path: raw 0/1 adjacency + self-loops, no normalization
+            X_fp, A_adj_fp, mask_fp = smile_to_dense_raw_graph(row["smile"], NMAX)
+        else:
+            X_fp, A_adj_fp, mask_fp = smile_to_dense_graph(row["smile"], NMAX)
 
         # Tile mask to (NMAX, POOL_DIM) for maxpool — column replication
         # (matches share_data.share_drug_graph pre-tiling contract)
         mask_tiled = np.broadcast_to(mask_fp.reshape(NMAX, 1), (NMAX, POOL_DIM))
 
         X_batch[batch_idx] = X_fp
-        A_batch[batch_idx] = A_hat_fp
+        A_batch[batch_idx] = A_adj_fp
         mask_batch[batch_idx] = mask_tiled
 
         # Get protein embedding (public, stored in fixed point)
@@ -114,7 +123,9 @@ def prepare_batch_samples(dataset: str, csv_path: str, row_indices: list,
 
     # Use share_data.split_shares for correct fixed-point + modular arithmetic
     X_s0, X_s1 = share_data.split_shares(X_batch, scale=scale, seed=seed + 0, bw=bw)
-    A_s0, A_s1 = share_data.split_shares(A_batch, scale=scale, seed=seed + 1, bw=bw)
+    # raw_adj: adjacency is a 0/1 integer tensor — share it at scale=0
+    adj_scale = 0 if raw_adj else scale
+    A_s0, A_s1 = share_data.split_shares(A_batch, scale=adj_scale, seed=seed + 1, bw=bw)
     mask_s0, mask_s1 = share_data.split_shares(mask_batch, scale=scale, seed=seed + 2, bw=bw)
 
     # Reshape back to tensor shapes and write
@@ -141,6 +152,8 @@ def prepare_batch_samples(dataset: str, csv_path: str, row_indices: list,
         "dataset": dataset,
         "scale": scale,
         "bw": bw,
+        "raw_adj": raw_adj,
+        "adj_scale": 0 if raw_adj else scale,
         "nmax": NMAX,
         "feat_dim": FEAT_DIM,
         "pool_dim": POOL_DIM,

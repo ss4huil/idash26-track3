@@ -99,9 +99,17 @@ public:
             auto filename = keyFile + "_inference_key" + std::to_string(party) + ".dat";
             keySize = std::filesystem::file_size(filename);
             fd = openForReading(filename);
-            // FIX: disable pinning for eval — 2 concurrent parties on 8GB GPU OOM
-            getAlignedBuf(&keyBuf, keySize, false);
-            startPtr = keyBuf;
+            // Chunked streaming mode (DDG_NUM_CHUNKS>1): keys are pread per
+            // chunk into caller-managed pinned slots and bound to the key
+            // arena via setGPUKeyArenaSlot — skip the whole-file host buffer.
+            const char *ncEnv = std::getenv("DDG_NUM_CHUNKS");
+            int numChunks = ncEnv ? atoi(ncEnv) : 1;
+            if (numChunks <= 1)
+            {
+                // FIX: disable pinning for eval — 2 concurrent parties on 8GB GPU OOM
+                getAlignedBuf(&keyBuf, keySize, false);
+                startPtr = keyBuf;
+            }
         }
         peer = new GpuPeer(compress);
         peer->connect(party, ip);
@@ -295,7 +303,7 @@ public:
 
     void add(const std::vector<Tensor<T> *> &in, Tensor<T> &out)
     {
-        int tmpBw = bw - scale;
+        int tmpBw = bw;  // Fixed-point add preserves scale: use the full ring
         int N = in[0]->size();
         std::vector<T *> gpuInp;
         for (int i = 0; i < in.size(); i++)
@@ -485,7 +493,7 @@ public:
 
     void add(const std::vector<Tensor<T> *> &in, Tensor<T> &out)
     {
-        int tmpBw = this->bw - this->scale;
+        int tmpBw = this->bw;  // Fixed-point add preserves scale: use the full ring
         int N = in[0]->size();
         std::vector<T *> gpuInp;
         for (int i = 0; i < in.size(); i++)
