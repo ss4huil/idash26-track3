@@ -7,7 +7,7 @@
 #
 # Usage examples:
 #
-#   # Local RTX 4060 (SM 8.9), 32-bit ring, local toolkit install:
+#   # Local RTX 4060 (SM 8.9), 32-bit ring (fast test only), local toolkit:
 #   make GPU_MPC_ROOT=$HOME/EzPC/GPU-MPC BW=32 GPU_ARCH=89 deepdtagen_inference
 #
 #   # H100 (SM 9.0a), 64-bit production ring:
@@ -23,14 +23,14 @@
 #   4. ~/.local/cuda-$(CUDA_VERSION)/usr/local/cuda-$(CUDA_VERSION)/bin/nvcc
 #      (local .run toolkit install, no sudo)
 #
-# BW=32 default: 32-bit ring halves share bandwidth for rapid testing and
-# matches the reference/share_data.py bw=32 mode.  Switch to BW=64 for the
-# final production submission.
+# BW=64 default (v2 production): the LocalARS probabilistic truncation is only
+# safe on the 64-bit ring at scale=12 (design doc §2 / appendix A). BW=32
+# remains available for fast plumbing tests with DDG_EXACT_TRUNC=1.
 
 GPU_MPC_ROOT ?= $(HOME)/EzPC/GPU-MPC
 CUDA_VERSION ?= 12.1
 GPU_ARCH     ?= 89
-BW           ?= 32
+BW           ?= 64
 
 CUTLASS_PATH      = $(GPU_MPC_ROOT)/ext/cutlass
 SYTORCH_PATH      = $(GPU_MPC_ROOT)/ext/sytorch

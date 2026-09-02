@@ -2,8 +2,9 @@
 contract. Both the Python offline pipeline and the C++/CUDA online binary must
 agree on these values (see gpu_mpc/deepdtagen_inference.cu)."""
 
-BW = 32            # ring Z_{2^32}
-SCALE = 12         # Q20.12 fixed-point fractional bits
+BW = 64            # ring Z_{2^64} — v2 production path (LocalARS truncation
+                   # requires bw=64; see design doc §2). BW=32 is test-only.
+SCALE = 12         # Q51.12 fixed-point fractional bits (Q20.12 at bw=32)
 NMAX = 138         # padded graph nodes
 FEAT_DIM = 94      # node feature width
 POOL_DIM = 376     # final GCN width == pooled embedding width

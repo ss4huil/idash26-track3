@@ -286,13 +286,10 @@ int main(int argc, char *argv[])
         // The DDGOrcaKeygen constructor calls initGPURandomness() (seed 12345),
         // so randomGEOnGpu is ready AFTER this line.
 
-        // Select backend based on optimization flags
-        DDGOrcaBaseKeygen<InfType> *fss = nullptr;
-        if (std::getenv("DDG_SLACK_TRUNC") || std::getenv("DDG_LOCAL_TRUNC")) {
-            fss = new DDGOrcaKeygenBatched<InfType>(party, bw, scale, keyFileName);
-        } else {
-            fss = new DDGOrcaKeygen<InfType>(party, bw, scale, keyFileName);
-        }
+        // Backend: always the batched class — it owns truncation-mode
+        // selection (LocalARS default, DDG_EXACT_TRUNC=1 → TrFloor fallback).
+        DDGOrcaBaseKeygen<InfType> *fss =
+            new DDGOrcaKeygenBatched<InfType>(party, bw, scale, keyFileName);
         model->setBackend(fss);
         model->optimize();
 
@@ -434,13 +431,10 @@ int main(int argc, char *argv[])
         if (party == 1)
             loadShare(shareDir + "/protein_emb.dat", proteinEmb);
 
-        // Select backend based on optimization flags
-        DDGOrcaBase<InfType> *fss = nullptr;
-        if (std::getenv("DDG_SLACK_TRUNC") || std::getenv("DDG_LOCAL_TRUNC")) {
-            fss = new DDGOrcaBatched<InfType>(party, ip, bw, (int)scale, keyFileName);
-        } else {
-            fss = new DDGOrca<InfType>(party, ip, bw, (int)scale, keyFileName);
-        }
+        // Backend: always the batched class (truncation mode via env, see
+        // ddg_orca_batched.h; LocalARS default, DDG_EXACT_TRUNC=1 → TrFloor).
+        DDGOrcaBase<InfType> *fss =
+            new DDGOrcaBatched<InfType>(party, ip, bw, (int)scale, keyFileName);
         model->setBackend(fss);
         model->optimize();
 
@@ -639,13 +633,9 @@ int main(int argc, char *argv[])
             return e && e[0] == '0';
         }();
 
-        // Select backend based on optimization flags (same as NC==1).
-        DDGOrcaBase<InfType> *fss = nullptr;
-        if (std::getenv("DDG_SLACK_TRUNC") || std::getenv("DDG_LOCAL_TRUNC")) {
-            fss = new DDGOrcaBatched<InfType>(party, ip, bw, (int)scale, keyFileName);
-        } else {
-            fss = new DDGOrca<InfType>(party, ip, bw, (int)scale, keyFileName);
-        }
+        // Backend: always the batched class (same as NC==1).
+        DDGOrcaBase<InfType> *fss =
+            new DDGOrcaBatched<InfType>(party, ip, bw, (int)scale, keyFileName);
         model->setBackend(fss);
         model->optimize();
 

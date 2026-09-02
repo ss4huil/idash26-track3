@@ -344,6 +344,12 @@ T *ddgSecureAdjNormKeygen(
     //
     // Deterministic TrFloor(scale)
     //        -> scale s
+    //
+    // NOTE (v2): this mul's truncation is pinned to FSS TrFloor on purpose —
+    // it does NOT follow the global default switch to LocalARS in
+    // ddg_orca_batched.h. The A_norm values feed every downstream GCN layer,
+    // so we keep the exact rounding here; keygen (here) and eval (below) both
+    // hardcode TruncateType::TrFloor, so the two sides stay consistent.
     // ------------------------------------------------------------------------
     T *d_norm_mask =
         gpuKeygenMul<T>(
