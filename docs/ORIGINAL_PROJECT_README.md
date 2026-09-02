@@ -1,4 +1,4 @@
-> **iDASH 2026 Track 3 submission version**: see **[SUBMISSION_README.md](SUBMISSION_README.md)** for
+> **iDASH 2026 Track 3 submission version**: see **[the submission README](../README.md)** for
 > how to run the evaluation (`competition_run.sh`, zero-config), the method description, and the
 > input data format. Framework patches: `patches/EzPC-GPU-MPC.track3.patch`.
 > Pre-built H100 binaries: `gpu_mpc/deepdtagen_inference_h100_bw{32,64}`. Tag: `track3-v1-submission`.
