@@ -36,17 +36,24 @@ pipeline) automatically. Details and expert overrides are in Section 6.
 
 This submission implements a GPU-accelerated two-party secure inference system for the
 **affinity prediction branch** of DeepDTAGen (GCN over the molecular graph + masked global
-max-pooling + FC layers), using 2-party additive secret sharing over the ring Z_2^32 with
-FSS-based (Orca/SIGMA-style) non-linear protocols in the preprocessing (trusted-dealer)
-model. The drug molecule (SMILES graph) is the private input; the protein sequence and the
-model weights are public.
+max-pooling + FC layers), using 2-party additive secret sharing over the ring Z_2^32 /
+Z_2^64 in the preprocessing (trusted-dealer) model. The drug molecule (SMILES graph) is
+the private input; the protein sequence and the model weights are public.
+
+Two interchangeable backends for the non-linear (ReLU/compare) layer are provided:
+
+- **FSS backend** (default, `master`): Orca/SIGMA-style DCF keys, evaluated on GPU.
+- **LSS backend** (opt-in, `dev-v2`): dealer-generated secret-shared correlations
+  (Matchmaker-style) with PRF seed compression, evaluated on CPU — shrinks the ReLU key
+  material ~20× and end-to-end online time 3.85× in the SSD-streaming regime
+  (Section 3.4).
 
 Security: 128-bit computational security (AES-based DPF/DCF key generation), semi-honest
 adversary, one corruption.
 
 ## 3. Method
 
-### 2.1 Compliant online adjacency normalization (A_hat)
+### 3.1 Compliant online adjacency normalization (A_hat)
 
 Per the competition rules, the degree matrix D and D^{-1/2} are derived **online** from the
 secret shares of the raw adjacency matrix A — no precomputed normalized adjacency is given
@@ -73,7 +80,7 @@ This is **exact** (the table entries are the same fixed-point quantization the p
 pipeline would produce), costs ~2 communication rounds and <5% extra key material, and is
 fully compliant with the rule that D and D^{-1/2} be derived online from shares.
 
-### 2.2 GPU performance optimizations — Mode A: keys resident in memory
+### 3.2 GPU performance optimizations — Mode A: keys resident in memory
 
 When the FSS keys for the batch fit in RAM + VRAM, end-to-end online latency is minimized
 by eliminating host-side data movement and CPU/GPU serialization:
@@ -93,7 +100,7 @@ Measured on a single NVIDIA A10 (weaker than the evaluation H100), bw=32, scale=
 batch=16: **136 ms per batch (8.5 ms/sample)**, down from 485 ms for the unoptimized
 implementation (3.6×). Communication: 8.4 MB/sample.
 
-### 2.3 GPU performance optimizations — Mode B: keys streamed from SSD
+### 3.3 GPU performance optimizations — Mode B: keys streamed from SSD
 
 For evaluation-scale batches (up to hundreds of thousands of samples), FSS keys
 (~165 MB/sample/party at bw=32) far exceed RAM/VRAM capacity, so keys must be streamed
@@ -120,6 +127,54 @@ per chunk reduced from 443 ms to 3 µs when keys are on a fast device). Correctn
 verified bit-exact against single-chunk execution for NC=2/3/4 chunk counts and for
 zero-padded tail chunks.
 
+### 3.4 LSS comparison backend (v2, opt-in via `DDG_LSS_RELU=1`)
+
+The DCF comparison keys of the FSS backend account for ~85% of total key material
+(~167 of 198 MB/sample/party at bw=64), making large-batch runs SSD-bound. The LSS
+backend replaces DCF-based ReLU/DReLU with **secret-shared correlations generated
+directly by the dealer** (Matchmaker-style, ePrint 2025/424 — no two-party OT needed in
+the dealer model), evaluated on CPU:
+
+- **Protocol**: radix-16 Millionaires comparison (16 digits, 26 triples per 64-bit
+  comparison, 6 rounds) built from four dealer-supplied primitives — AND triples,
+  1-of-16 OT, MUX triples, and bit-to-arithmetic (B2A) correlations. DReLU/ReLU reduces
+  to one comparison + one MUX. Bridge to the GPU pipeline via masked-public ↔ share
+  conversion on an independent socket channel; OpenMP-parallel evaluation
+  (`DDG_LSS_THREADS`).
+- **LSS2 seed compression**: all pure-randomness components of the correlations are
+  regenerated online from per-party, per-record-type **AES-128-CTR PRF streams** (14
+  independent stream keys per party, counter mode with random access for the parallel
+  evaluator); only the correlation *corrections* are stored explicitly
+  (e.g. for an AND triple only `c0 = (a∧b)⊕c1` is stored — 1 bit). Record sizes
+  (bits, incl. 3-bit tag, party0/party1): AND triple 6→4/3; OT16-send 35→3;
+  OT16-recv 9→5; MUX triple 196→67/5; B2A 68→3/67; masks 67→3/3 or 3/67.
+- **Result**: ReLU key material 35.8 → **9.8 MB/sample** (both parties combined;
+  1046→225 bit/element for party 0); total per-sample key footprint
+  **198 → 36 MB/party** (5.5×). AES-NI regeneration is essentially free — the ReLU
+  stage got *faster* (1.04 → 0.76 s/forward at B=8) because memory traffic shrank.
+
+Security: 128-bit computational (AES-128 in CTR mode as PRF; FIPS-197 known-answer
+self-test at keygen time), semi-honest dealer + semi-honest parties. Full format and
+proof sketch: `gpu_mpc/lss/lss_protocol.md`.
+
+**N=128 head-to-head** (davis, bw=64, B=8×16 chunks, streaming pipeline, loopback,
+single A10 shared by both parties):
+
+| Metric | FSS backend | LSS2 backend | |
+|---|---|---|---|
+| Online wall time | 97.3 s | **25.3 s** | **3.85× faster** |
+| per sample | 760 ms | 197 ms | |
+| key total / party | 25.4 GB (198 MB/sample) | 4.6 GB (36 MB/sample) | 5.5× smaller |
+| online comm / party | 10.2 MB/sample | 27.5 MB/sample | 2.7× more |
+| keygen time / party | 52.3 s | 48.3 s | comparable |
+
+The bottleneck analysis flips: FSS is key-I/O-bound (81 of 97 s waiting on SSD reads;
+GPU 93% idle), while LSS2 fully hides I/O and is bound by the CPU ReLU evaluation
+(OT16 leaf construction + AND-tree opens, 86% of compute). Outputs of the two backends
+agree to max |Δ| = 0.0034 (fixed-point truncation noise), same MAE vs golden labels.
+See `docs/RESEARCH_LOG.md` for the complete engineering log, per-stage breakdown,
+pitfalls, and the prioritized list of remaining optimizations.
+
 ## 4. Repository layout and build
 
 ```
@@ -127,8 +182,11 @@ gpu_mpc/                    # MPC inference driver and model definition
   deepdtagen_inference.cu   # dealer + evaluator entry point (single binary, role switch)
   secure_adj_norm.h         # online adjacency normalization (Section 3.1)
   ddg_orca*.h               # FSS backend wrappers (DDGOrca eval / keygen classes)
+  lss/                      # LSS backend (Section 3.4): keygen, online primitives,
+                            #   compare/ReLU, GPU bridge, lss_protocol.md, unit tests
 reference/                  # plaintext reference model, weight export, share preparation
-scripts/dev_tools/          # dataset/share preparation utilities
+scripts/dev_tools/          # dataset/share preparation and validation utilities
+docs/RESEARCH_LOG.md        # full research log: measurements, pitfalls, future work
 ```
 
 External dependency: the GPU-MPC framework (EzPC/GPU-MPC), included/patched alongside.
@@ -212,11 +270,16 @@ Environment variables:
 | `DDG_KEYBUF_CAP_GB` | dealer-side key buffer cap (GB) |
 | `DDG_WEIGHTS_BIN` | path to exported weights |
 | `DDG_BW` | ring size at dealer time (32 default; **64 required for kiba** — its fusion-layer activations overflow the 32-bit ring; eval reads `bw` from `meta.json` automatically). Note: at bw=64 the zero-copy key arena is auto-disabled (key-layout alignment), falling back to the plain copy path |
+| `DDG_LSS_RELU=1` | route ReLU/DReLU through the LSS backend (Section 3.4) instead of FSS; requires `DDG_KEY_ARENA=0` at bw=64 |
+| `DDG_LSS_THREADS` | OpenMP threads for the LSS evaluator (set to the number of physical cores, e.g. 8) |
+| `DDG_EXACT_TRUNC=1` | fall back from LocalARS probabilistic truncation to exact truncation (default is LocalARS, which eliminates truncation keys: −47% key size) |
 
 **Output**: party 0 prints one line per sample: `AFFINITY[i]=<float>` — the predicted
 binding affinity (regression value, Q12 fixed-point decoded).
 
-## 7. Measured performance (NVIDIA A10, bw=32, scale=12, loopback)
+## 7. Measured performance (NVIDIA A10, scale=12, loopback)
+
+**FSS backend, bw=32:**
 
 | Setting | Time |
 |---|---|
@@ -226,4 +289,36 @@ binding affinity (regression value, Q12 fixed-point decoded).
 | Batch 16, simulated 1 Gbps full-duplex | 610 ms/batch |
 | Streaming mode, prefetch on | per-chunk key-load stall fully hidden behind compute |
 
-Key size: ~165 MB/sample/party; online communication: ~8.4 MB/sample.
+Key size: ~165 MB/sample/party (bw=32); online communication: ~8.4 MB/sample.
+
+**N=128 streaming benchmark, bw=64, FSS vs LSS2** (see Section 2.4 for the full table):
+FSS 97.3 s vs LSS2 **25.3 s** online (3.85×); key footprint 25.4 GB vs 4.6 GB per party.
+
+## 8. Development status and roadmap
+
+Completed and verified: compliant online adjacency normalization; both backends
+(FSS and LSS2) end-to-end on all three datasets (davis / kiba / bindingdb) with
+fixed-point outputs matching the official floating-point reference to ≤0.005;
+multi-chunk SSD streaming with prefetch; AES-CTR seed compression; parallel LSS
+evaluation.
+
+Known gaps / next steps (tracked in `docs/RESEARCH_LOG.md`):
+
+- **LSS key SSD streaming**: the `_lss.bin` key file is currently loaded into RAM once
+  at chunk 0 — fine up to ~50K samples/party, but needs chunked streaming beyond that.
+- **Turnkey integration**: `run_party.sh`'s automatic batch-size picker still uses
+  FSS-era per-sample key estimates; the LSS mode switch is not yet exposed in
+  `competition_run.sh`.
+- **Competition accuracy gate**: outputs were validated as regression values against
+  the floating-point reference; the official metric (mean of sensitivity and
+  specificity at several affinity thresholds) has not yet been evaluated on the full
+  test sets.
+- **Network-throttled benchmark**: the 3.85× figure is loopback; LSS trades 2.7× more
+  communication and more rounds, so a re-measurement under a rate-limited link
+  (>1 Gbps, RTT <1 ms) is needed before choosing which backend(s) to submit.
+- **Remaining key compression**: the non-ReLU FSS keys (~31 MB/sample/party) can
+  undergo the same seed-compression treatment (Beaver triples: regenerate a,b, store
+  only c), and the conv/GEMM key material has not yet been audited for redundancy
+  (public-weight × secret-input products need no triples at all).
+- H100 (sm_90a) binaries are compile-verified but have not been run on real H100
+  hardware.
