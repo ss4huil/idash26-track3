@@ -49,6 +49,26 @@ static int failures = 0;
 
 // ── keygen ──────────────────────────────────────────────────────────
 static bool do_keygen(const std::string &dir) {
+    // AES-128 FIPS-197 已知答案自测（LSS2 PRF 的正确性锚点；
+    // key=000102..0f, pt=00112233445566778899aabbccddeeff
+    // ⇒ ct=69c4e0d86a7b0430d8cdb78070b4c55a）
+    {
+        LssAesKey k;
+        lss_aes128_expand(k, 0x0706050403020100ULL, 0x0f0e0d0c0b0a0908ULL);
+        __m128i pt = _mm_set_epi64x((long long)0xffeeddccbbaa9988ULL,
+                                    (long long)0x7766554433221100ULL);
+        __m128i ct = lss_aes128_encrypt(k, pt);
+        uint64_t lo = (uint64_t)_mm_cvtsi128_si64(ct);
+        uint64_t hi =
+            (uint64_t)_mm_cvtsi128_si64(_mm_srli_si128(ct, 8));
+        if (lo != 0x30047b6ad8e0c469ULL || hi != 0x5ac5b47080b7cdd8ULL) {
+            fprintf(stderr, "[keygen] FAIL: AES-128 FIPS-197 自测向量不符 "
+                            "(ct=%016llx%016llx)\n",
+                    (unsigned long long)hi, (unsigned long long)lo);
+            return false;
+        }
+        printf("[keygen] AES-128 FIPS-197 自测通过\n");
+    }
     LssKeygen kg(KEYGEN_SEED);
     kg.gen_bit_triples(N_AND);
     kg.gen_ot16(N_OT, /*sender_party=*/0); // Millionaires 约定：party0=sender

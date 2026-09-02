@@ -24,8 +24,8 @@ class LssKeygen {
 public:
     // seed 给定后输出完全确定、可复现（keygen/eval 对齐调试依赖这一点；
     // 两个 dealer 进程用同一 master seed ⇒ 派生流种子与记录流一致）。
-    // PRF 用 splitmix64 计数器模式：见 lss_keys.h 的 TODO(production)，
-    // 最终提交需换 AES-CTR 以满足 128-bit 安全声明。
+    // PRF = AES-128-CTR（AES-NI；每条流种子经一次性 KDF 扩展成独立 AES key，
+    // 见 lss_keys.h 与 lss_protocol.md §9.3）。
     explicit LssKeygen(uint64_t seed);
 
     // 布尔 Beaver 三元组：a_i,b_i 双方 PRF 再生，c₁ 由 P1 流再生，
@@ -82,13 +82,14 @@ public:
 private:
     std::mt19937_64 rng_;               // 仅用于构造时派生各流种子
     uint64_t seeds_[2][LSS_NUM_SEEDS];  // [party][记录类型] PRF 流种子
+    LssAesKey keys_[2][LSS_NUM_SEEDS];  // 预展开的流 AES 轮密钥（只读）
     uint64_t ctr_[LSS_NUM_SEEDS] = {};  // 每类型已生成记录数（PRF 索引）
     BitWriter w_[2];
     uint64_t nrecs_ = 0;
 
     // party p 的类型 slot 流中第 idx 条记录的第 word 个 PRF 输出字
     uint64_t prf(int p, uint8_t slot, uint64_t idx, unsigned word) const {
-        return lss_prf(seeds_[p][slot], idx * LSS_PRF_STRIDE + word);
+        return lss_prf(keys_[p][slot], idx * LSS_PRF_STRIDE + word);
     }
 };
 

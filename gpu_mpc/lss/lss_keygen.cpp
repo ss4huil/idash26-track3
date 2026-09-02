@@ -7,9 +7,14 @@
 namespace lss {
 
 LssKeygen::LssKeygen(uint64_t seed) : rng_(seed) {
-    // master seed → 2×7 条流种子（确定性；两个 dealer 进程一致）
+    // master seed → 2×7 条流种子（确定性；两个 dealer 进程一致），
+    // 每条流种子经 KDF 预展开成 AES-128 轮密钥
+    lss_require_aesni();
     for (int p = 0; p < 2; p++)
-        for (size_t t = 0; t < LSS_NUM_SEEDS; t++) seeds_[p][t] = rng_();
+        for (size_t t = 0; t < LSS_NUM_SEEDS; t++) {
+            seeds_[p][t] = rng_();
+            keys_[p][t] = lss_stream_key(seeds_[p][t]);
+        }
 }
 
 void LssKeygen::gen_bit_triples(uint64_t count) {

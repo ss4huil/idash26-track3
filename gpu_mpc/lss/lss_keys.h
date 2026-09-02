@@ -58,18 +58,91 @@ constexpr size_t   LSS_NUM_SEEDS  = 7;   // 每记录类型一条 PRF 流（含 
 constexpr size_t   LSS_HEADER_SZ  = 32 + LSS_NUM_SEEDS * 8; // 88 B
 constexpr size_t   LSS_TRAILER_SZ = 24;
 
-// ── LSS2 计数器模式 PRF（随机访问：在线 get_at 并行消费要求可按序号再生）──
-// splitmix64 混合器；记录 i 的第 word 个输出字 = lss_prf(seed, i*STRIDE+word)。
-// TODO(production/最终提交): 换 AES-CTR（每记录 1 个 128-bit 分组，计数器 =
-// record_idx，不同流用不同 key/IV）以满足 128-bit 安全声明；splitmix64 只是
-// 正确性/体积验证阶段的占位 PRF（见 lss_protocol.md §9 安全讨论）。
+// ── LSS2 计数器模式 PRF：AES-128-CTR（AES-NI 硬件指令）──────────────────
+// 设计（lss_protocol.md §9.3）：每条流（party × 记录类型，共 2×7 条）持一个
+// 独立 AES-128 key，由 header 里的 64-bit 流种子经 splitmix64 一次性扩展
+// （KDF，仅构造期一次）；记录 i 的第 word 个输出字 =
+//   AES-128_K(ctr ‖ 0) 的低 64 bit，ctr = i·STRIDE + word。
+// 不同流 ⇒ 不同 key ⇒ 计数器空间天然隔离。key schedule 在 keygen/eval 构造期
+// 预展开（LssAesKey，只读共享），在线热路径每输出字只做 10 轮 AESENC，
+// 无共享可变状态 ⇒ OpenMP 线程安全。
+//
+// 实现：AES-NI 内建函数（与本仓库 SCI/src/utils/aes-ni.h 同属公开领域的
+// AESNI.c 习语），用 __attribute__((target("aes"))) 限定，无需给编译链加
+// -maes（nvcc host 端同样可编译）；lss 模块保持零外部依赖。运行时在
+// keygen/eval 构造期用 __builtin_cpu_supports("aes") 检查一次性失败退出。
+#include <wmmintrin.h>
+
 constexpr uint64_t LSS_PRF_STRIDE = 4; // 每条记录最多用 4 个 PRF 输出字
 
-inline uint64_t lss_prf(uint64_t seed, uint64_t ctr) {
-    uint64_t x = seed ^ (ctr * 0x9E3779B97F4A7C15ULL);
+// AES-128 展开后的 11 轮密钥（构造期算好，之后只读）
+struct LssAesKey {
+    __m128i rk[11];
+};
+
+inline void lss_require_aesni() {
+    if (!__builtin_cpu_supports("aes"))
+        throw std::runtime_error("lss: LSS2 PRF (AES-CTR) 需要 AES-NI，"
+                                 "当前 CPU 不支持");
+}
+
+// splitmix64 混合器：仅用于 64-bit 流种子 → 128-bit AES key 的一次性 KDF
+// （不作为在线 PRF）。
+inline uint64_t lss_kdf_mix(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
     return x ^ (x >> 31);
+}
+
+__attribute__((target("aes"))) inline __m128i
+lss_aes128_expand_step(__m128i k, const int rcon) {
+    __m128i a = _mm_aeskeygenassist_si128(k, rcon);
+    a = _mm_shuffle_epi32(a, 0xff);
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    k = _mm_xor_si128(k, _mm_slli_si128(k, 4));
+    return _mm_xor_si128(k, a);
+}
+
+// 由 128-bit key（lo/hi 两个 u64，小端装入）展开轮密钥
+__attribute__((target("aes"))) inline void
+lss_aes128_expand(LssAesKey &out, uint64_t lo, uint64_t hi) {
+    __m128i k = _mm_set_epi64x((long long)hi, (long long)lo);
+    out.rk[0] = k;
+    out.rk[1] = lss_aes128_expand_step(k, 0x01);
+    out.rk[2] = lss_aes128_expand_step(out.rk[1], 0x02);
+    out.rk[3] = lss_aes128_expand_step(out.rk[2], 0x04);
+    out.rk[4] = lss_aes128_expand_step(out.rk[3], 0x08);
+    out.rk[5] = lss_aes128_expand_step(out.rk[4], 0x10);
+    out.rk[6] = lss_aes128_expand_step(out.rk[5], 0x20);
+    out.rk[7] = lss_aes128_expand_step(out.rk[6], 0x40);
+    out.rk[8] = lss_aes128_expand_step(out.rk[7], 0x80);
+    out.rk[9] = lss_aes128_expand_step(out.rk[8], 0x1b);
+    out.rk[10] = lss_aes128_expand_step(out.rk[9], 0x36);
+}
+
+// 流种子 → 本条流的 AES-128 key（KDF：splitmix64 两次，域分隔常数）
+inline LssAesKey lss_stream_key(uint64_t seed) {
+    LssAesKey k;
+    uint64_t lo = lss_kdf_mix(seed);
+    uint64_t hi = lss_kdf_mix(seed ^ 0x9E3779B97F4A7C15ULL);
+    lss_aes128_expand(k, lo, hi);
+    return k;
+}
+
+// AES-128 单分组加密（自测/通用入口）
+__attribute__((target("aes"))) inline __m128i
+lss_aes128_encrypt(const LssAesKey &k, __m128i m) {
+    m = _mm_xor_si128(m, k.rk[0]);
+    for (int i = 1; i < 10; i++) m = _mm_aesenc_si128(m, k.rk[i]);
+    return _mm_aesenclast_si128(m, k.rk[10]);
+}
+
+// 计数器模式 PRF：ctr → 伪随机 u64。纯函数、无状态、线程安全。
+inline uint64_t lss_prf(const LssAesKey &k, uint64_t ctr) {
+    __m128i m = _mm_set_epi64x(0, (long long)ctr);
+    return (uint64_t)_mm_cvtsi128_si64(lss_aes128_encrypt(k, m));
 }
 
 // 每条记录的总 bit 数（含 3-bit 标签）按 (类型, party) 定长——随机访问
@@ -304,6 +377,10 @@ public:
             throw std::runtime_error("lss: trailer 计数与 header 不符 " + path);
         if (t_sum != fnv1a64(payload.data(), pbytes))
             throw std::runtime_error("lss: payload checksum 不符 " + path);
+        // LSS2：预展开 7 条流的 AES-128 轮密钥（之后只读，线程安全）
+        lss_require_aesni();
+        for (size_t t = 0; t < LSS_NUM_SEEDS; t++)
+            stream_keys_[t] = lss_stream_key(header.seeds[t]);
         reader = BitReader(payload.data(), header.payload_bits);
     }
 
@@ -334,14 +411,15 @@ public:
     // 当前该类型下一条记录的流内序号（PRF 索引基准）
     uint64_t stream_pos(uint8_t t) const { return ctr_[stream_slot(t)]; }
     void stream_advance(uint8_t t, uint64_t n) { ctr_[stream_slot(t)] += n; }
-    // 本方记录 rec_idx（流内序号）的第 word 个 PRF 输出字
+    // 本方记录 rec_idx（流内序号）的第 word 个 PRF 输出字（AES-128-CTR）
     uint64_t prf(uint8_t seed_slot, uint64_t rec_idx, unsigned word) const {
-        return lss_prf(header.seeds[seed_slot],
+        return lss_prf(stream_keys_[seed_slot],
                        rec_idx * LSS_PRF_STRIDE + word);
     }
 
 private:
-    uint64_t ctr_[LSS_NUM_SEEDS] = {}; // 每类型的已消费记录数（PRF 索引）
+    uint64_t ctr_[LSS_NUM_SEEDS] = {};   // 每类型的已消费记录数（PRF 索引）
+    LssAesKey stream_keys_[LSS_NUM_SEEDS]; // 预展开的流轮密钥（只读）
 };
 
 } // namespace lss

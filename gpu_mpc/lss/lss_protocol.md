@@ -180,10 +180,9 @@ party1 = 16×k_r(2 bit) + aa1(2 bit) ≈ 4.3 B/元素。
 
 ## PRG 说明
 
-LSS2：master seed 派生 2×7 条计数器模式 PRF 流种子（mt19937_64 仅用于
-这一步派生），记录内容全部由流种子按记录序号再生（§9）。
-**生产/最终提交须把占位 PRF（splitmix64 混合器）换成 AES-CTR**，
-以满足 128-bit 安全声明（TODO，见 §9 与 lss_keys.h）。
+LSS2：master seed 派生 2×7 条流种子（mt19937_64 仅用于这一步派生）；
+每条流种子经 splitmix64 KDF 扩展成独立 AES-128 key，记录内容由
+**AES-128-CTR**（AES-NI）按记录序号再生（§9）。128-bit 安全论证见 §9.3。
 
 ## 8. GPU 管线桥接（P3，设计文档 §5.2）
 
@@ -227,10 +226,12 @@ n×MASK_OUT，eval 按同序消费（标签校验防图序错位）。
 - 记录流仍是单一连续 LSB-first 比特流，每条记录以 3-bit 类型标签开头
   （标签照旧校验防图序错位）。**记录定长但按 (类型, party) 不同**，
   随机访问偏移 = base + i × record_total_bits(type, party)。
-- PRF：计数器模式，记录 i 的第 j 个输出字 =
-  `splitmix64(seed ^ ((i·4+j) · 0x9E3779B97F4A7C15))`（i = 流内记录序号，
+- PRF：**AES-128-CTR**（计数器模式，AES-NI 硬件指令）。记录 i 的第 j 个
+  输出字 = `AES-128_K(ctr ‖ 0)` 低 64 bit，`ctr = i·4+j`（i = 流内记录序号，
   与文件内 bit 偏移无关——在线 OpenMP 随机访问与 dealer 顺序生成用同一
   序号，由每类型消费/生成计数器维护；`rewind()` 同时复位游标与计数器）。
+  每条流的 K 由 header 中 64-bit 种子经 splitmix64 一次性扩展（KDF，
+  仅 keygen/eval 构造期执行；splitmix64 不再是 PRF 本身）。
 - Trailer（24 B）同 v1（num_records | payload_bytes | FNV-1a checksum）。
 
 ### 9.2 各记录类型的压缩（bit 数含 3-bit 标签；"再生"= 由本方流种子算出）
@@ -262,10 +263,18 @@ v2 等价地让"份额侧"的随机量全部由 PRF 流输出、明文相关性�
 附加安全假设（相对 v1 的新增）：
 - PRF 种子即每方的全部秘密：key 文件的保密性与 v1 相同（v1 文件同样
   包含全部份额），不引入新的密钥管理面；
-- ⚠️ 当前 PRF 是 splitmix64 占位（统计性质好但非密码学 PRF，且只有
-  64-bit 种子）。**最终提交必须换 AES-CTR**（128-bit key/计数器，每记录
-  一个分组）才能支撑 128-bit 安全声明——接口已是计数器模式，替换只动
-  `lss_prf` 一处。
+- **PRF 已实现为 AES-128-CTR（AES-NI）**：每方每记录类型一条流、每条流
+  一个独立 AES-128 key（64-bit 流种子经 splitmix64 KDF 扩展；KDF 仅构造期
+  一次，不影响在线安全性论证——论证依赖的是 AES 分组置换的伪随机性）。
+  128-bit 安全支撑：key 长度 128 bit；CTR 模式下不同 counter 的分组输入
+  互不重复（每条流 counter 空间 = 记录序号×4+word，流的记录数 ≪ 2^64，
+  永不回绕）；流间隔离靠每流独立 key（不同 key 下的 AES 输出不可互相
+  预测，无需保留 counter 前缀做域分隔）。在该 PRF 假设下，§9.3 上文的
+  分布等价论证成立，半诚实安全性归约到 AES-128 的 PRP/PRF 安全性。
+- 实现要点：key schedule 构造期预展开、之后只读共享（OpenMP 线程安全）；
+  AES-NI 运行时在构造期用 `__builtin_cpu_supports("aes")` 检查，缺失则
+  直接报错退出（不会静默退化）。正确性由 lss_test 内的 FIPS-197 已知
+  答案向量锚定。
 
 ### 9.4 实测压缩效果
 
