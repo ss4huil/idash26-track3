@@ -141,8 +141,13 @@ def prepare_batch_samples(dataset: str, csv_path: str, row_indices: list,
 
     # Write protein embeddings (no sharing, party 1 loads this)
     # Quantize to fixed-point using the same scheme as export_protein_emb
+    # NOTE: np.int64(1) << 64 overflows (shift >= width) — at bw=64 the ring
+    # modulus is 2^64, i.e. int64 bit patterns ARE the residues; just cast.
     protein_fx = np.rint(protein_emb_batch * (1 << scale)).astype(np.int64)
-    protein_ring = np.mod(protein_fx, np.int64(1) << bw).astype(dtype_str)
+    if bw >= 64:
+        protein_ring = protein_fx.astype(dtype_str)
+    else:
+        protein_ring = np.mod(protein_fx, np.int64(1) << bw).astype(dtype_str)
     protein_ring.tofile(os.path.join(batch_dir, "protein_emb.dat"))
 
     # Create manifest

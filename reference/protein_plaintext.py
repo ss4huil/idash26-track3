@@ -20,7 +20,12 @@ def export_protein_emb(pvec_float, out_dir: str,
                        scale: int = mpc_config.SCALE, bw: int = mpc_config.BW) -> str:
     os.makedirs(out_dir, exist_ok=True)
     fixed = np.rint(np.asarray(pvec_float, np.float64) * (1 << scale)).astype(np.int64)
-    ring = np.mod(fixed, np.int64(1) << bw).astype(f"<u{bw // 8}")
+    # np.int64(1) << 64 overflows (shift >= width); at bw=64 int64 bit
+    # patterns already ARE the ring residues, so cast directly.
+    if bw >= 64:
+        ring = fixed.astype(f"<u{bw // 8}")
+    else:
+        ring = np.mod(fixed, np.int64(1) << bw).astype(f"<u{bw // 8}")
     path = os.path.join(out_dir, mpc_config.PROTEIN_EMB_FILE)
     ring.tofile(path)
     return path
