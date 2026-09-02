@@ -1,3 +1,8 @@
+> **iDASH 2026 Track 3 submission version**: see **[SUBMISSION_README.md](SUBMISSION_README.md)** for
+> how to run the evaluation (`competition_run.sh`, zero-config), the method description, and the
+> input data format. Framework patches: `patches/EzPC-GPU-MPC.track3.patch`.
+> Pre-built H100 binaries: `gpu_mpc/deepdtagen_inference_h100_bw{32,64}`. Tag: `track3-v1-submission`.
+
 # GPU-Accelerated 2PC for DeepDTAGen
 
 A GPU-accelerated two-party computation (2PC) implementation of DeepDTAGen, a graph neural network for drug-target affinity prediction. This project uses the EzPC/GPU-MPC framework to perform secure inference over encrypted drug-protein data.
